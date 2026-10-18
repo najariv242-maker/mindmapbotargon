@@ -1,5 +1,5 @@
 """
-bot.py - Telegram Mind Map Bot with Keep-Alive for Render
+bot.py - Telegram Mind Map Bot with Built-in Env Loader & Keep-Alive
 """
 
 from __future__ import annotations
@@ -13,7 +13,19 @@ import uuid
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from dotenv import load_dotenv
+# بارگذاری ایمن متغیرهای محیطی (بدون کرش در صورت نبود پکیج dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    _env_file = Path(".env")
+    if _env_file.is_file():
+        for _line in _env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -35,8 +47,6 @@ from telegram.ext import (
 from keep_alive import keep_alive
 from parser import Node, parse_input
 from renderer import FONT_CONFIG, BrowserManager, render_mindmap
-
-load_dotenv()
 
 BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
