@@ -1,5 +1,5 @@
 """
-bot.py - Telegram Mind Map Bot with Built-in Env Loader & Keep-Alive
+bot.py - Telegram Mind Map Bot with Render Timeout Protection & Keep-Alive
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import uuid
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-# بارگذاری ایمن متغیرهای محیطی (بدون کرش در صورت نبود پکیج dotenv)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -69,6 +68,7 @@ _CB_PREFIX = "FONT:"
 _TREES_STORE_KEY = "_mindmap_trees"
 _MAX_STORED_TREES_PER_USER = 5
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+_RENDER_TOTAL_TIMEOUT_SEC = 60.0
 
 _RENDER_SEMAPHORE = asyncio.Semaphore(max(1, MAX_CONCURRENT_RENDERS))
 
@@ -324,11 +324,23 @@ async def handle_font_selection(
 
     try:
         async with _RENDER_SEMAPHORE:
-            result = await render_mindmap(
-                root=tree,
-                font_key=font_key,
-                fonts_dir=FONTS_DIR,
+            result = await asyncio.wait_for(
+                render_mindmap(
+                    root=tree,
+                    font_key=font_key,
+                    fonts_dir=FONTS_DIR,
+                ),
+                timeout=_RENDER_TOTAL_TIMEOUT_SEC,
             )
+    except asyncio.TimeoutError:
+        logger.error("Render timed out after %s seconds", _RENDER_TOTAL_TIMEOUT_SEC)
+        await BrowserManager.shutdown()
+        if status_msg:
+            await status_msg.edit_text(
+                text="⏱ زمان رندر بیش از حد مجاز طول کشید. مرورگر بازنشانی شد؛ لطفاً مجدداً تلاش کنید.",
+                parse_mode=ParseMode.HTML,
+            )
+        return WAIT_INPUT
     except Exception as exc:
         logger.exception("Playwright rendering failed")
         if status_msg:
