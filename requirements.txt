@@ -1,3 +1,4 @@
-python-telegram-bot==21.10
-playwright==1.48.0
-python-dotenv==1.0.1
+# Production dependencies — Windows 10 / Python 3.11+ compatible
+aiogram>=3.13,<4.0
+python-dotenv>=1.0,<2.0
+playwright>=1.45,<2.0
