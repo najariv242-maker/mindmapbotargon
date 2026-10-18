@@ -1,69 +1,309 @@
-"""parser.py — converts AI JSON output to the branch-tree structure."""
+"""
+parser.py - Unified OPML & Markdown to Mind Map Tree Converter
+"""
+
 from __future__ import annotations
-import json
+
+import logging
+import os
 import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 
-def _clean_title(s: str) -> str:
-    """Strip leading bullets, dashes, numbers, and whitespace."""
-    return re.sub(r"^[\s\-\*\#\•\d\.]+", "", str(s)).strip()
+@dataclass
+class Node:
+    text: str
+    level: int = 0
+    children: List["Node"] = field(default_factory=list)
+
+    def add_child(self, child: "Node") -> "Node":
+        child.level = self.level + 1
+        self.children.append(child)
+        return child
+
+    def normalize_levels(self, current_level: int = 0) -> "Node":
+        self.level = current_level
+        for child in self.children:
+            child.normalize_levels(current_level + 1)
+        return self
+
+    def count_nodes(self) -> int:
+        return 1 + sum(child.count_nodes() for child in self.children)
 
 
-def _normalise_node(raw: dict) -> dict:
-    """Recursively normalise a branch/subtopic node."""
-    title = _clean_title(raw.get("title", "بدون عنوان"))
-    children = [_normalise_node(c) for c in (raw.get("children") or []) if c]
-    return {"title": title, "children": children}
+_TAB_SIZE = 2
+
+_INLINE_MD_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\*\*(.+?)\*\*"), r"\1"),
+    (re.compile(r"__(.+?)__"), r"\1"),
+    (re.compile(r"`([^`]+)`"), r"\1"),
+    (re.compile(r"~~(.+?)~~"), r"\1"),
+    (re.compile(r"!\[([^\]]*)\]\([^)]+\)"), r"\1"),
+    (re.compile(r"\[([^\]]+)\]\([^)]+\)"), r"\1"),
+]
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_BULLET_RE = re.compile(
+    r"^([ \t]*)(?:[-*+•]|(?:\d+|[۰-۹]+)[.\)])\s+(.+)$"
+)
+_HR_RE = re.compile(r"^([-*_])\1{2,}$")
 
 
-def parse_mindmap_json(data: dict) -> tuple[str, list[dict]]:
-    """
-    Expects the dict returned by OpenAI JSON mode:
-    {"title": str, "branches": [...]}
-
-    Returns (central_title, branches_list).
-    """
-    title = _clean_title(data.get("title", "نقشه‌ذهنی"))
-    branches = [_normalise_node(b) for b in (data.get("branches") or []) if b]
-    return title, branches
+def clean_topic_text(raw_text: str) -> str:
+    text = raw_text.strip()
+    for pattern, replacement in _INLINE_MD_PATTERNS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
 
 
-# Kept for backwards-compat / fallback plain-text parsing
-def parse_mindmap_text(text: str) -> tuple[str, list[dict]]:
-    """
-    Fallback: parse indented plain text if JSON mode fails.
-    First non-empty line = central title; indented lines = tree.
-    """
-    # Try JSON first
+def _stem(filename: Optional[str], default: str = "موضوع اصلی") -> str:
+    if not filename:
+        return default
+    base = os.path.splitext(os.path.basename(filename))[0]
+    cleaned = clean_topic_text(base.replace("_", " ").replace("-", " "))
+    return cleaned or default
+
+
+def _decode_source(source: Union[str, bytes, Path]) -> str:
+    if isinstance(source, Path):
+        return source.read_text(encoding="utf-8-sig", errors="replace")
+    if isinstance(source, bytes):
+        return source.decode("utf-8-sig", errors="replace")
+    return str(source).lstrip("\ufeff")
+
+
+def parse_opml(
+    source: Union[str, bytes, Path],
+    filename: Optional[str] = None,
+    default_root_title: str = "موضوع اصلی",
+) -> Node:
+    xml_text = _decode_source(source).strip()
+    if not xml_text:
+        raise ValueError("فایل OPML خالی است.")
+
     try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "branches" in data:
-            return parse_mindmap_json(data)
-    except (json.JSONDecodeError, TypeError):
-        pass
+        root_elem = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(f"ساختار فایل OPML/XML نامعتبر است: {exc}") from exc
 
-    lines = [l for l in text.splitlines() if l.strip()]
-    if not lines:
-        return "نقشه‌ذهنی", []
+    body_elem = root_elem.find("body")
+    if body_elem is None:
+        for child in root_elem:
+            if child.tag.lower().endswith("body"):
+                body_elem = child
+                break
+    if body_elem is None:
+        body_elem = root_elem
 
-    central = _clean_title(lines[0])
-    branches: list[dict] = []
-    stack: list[tuple[int, dict]] = []
+    def _outline_to_node(elem: ET.Element, level: int) -> Node:
+        label = (
+            elem.attrib.get("text")
+            or elem.attrib.get("title")
+            or elem.attrib.get("name")
+            or (elem.text.strip() if elem.text else "")
+        )
+        cleaned_label = clean_topic_text(label) if label else "بدون عنوان"
+        node = Node(text=cleaned_label or "بدون عنوان", level=level)
+        for child_elem in elem:
+            if child_elem.tag.lower().endswith("outline"):
+                node.children.append(_outline_to_node(child_elem, level + 1))
+        return node
 
-    for raw in lines[1:]:
-        if not raw.strip():
-            continue
-        indent = len(raw) - len(raw.lstrip())
-        node: dict = {"title": _clean_title(raw), "children": []}
+    top_outlines = [
+        el for el in body_elem if el.tag.lower().endswith("outline")
+    ]
+    if not top_outlines:
+        raise ValueError("هیچ گره <outline> در فایل OPML یافت نشد.")
 
-        while stack and stack[-1][0] >= indent:
+    if len(top_outlines) == 1:
+        root_node = _outline_to_node(top_outlines[0], level=0)
+        return root_node.normalize_levels(0)
+
+    head_title: Optional[str] = None
+    for child in root_elem:
+        if child.tag.lower().endswith("head"):
+            for sub in child:
+                if sub.tag.lower().endswith("title") and sub.text and sub.text.strip():
+                    head_title = clean_topic_text(sub.text)
+                    break
+
+    fallback_title = head_title or _stem(filename, default=default_root_title)
+    root_node = Node(text=fallback_title, level=0)
+    for outline_el in top_outlines:
+        root_node.add_child(_outline_to_node(outline_el, level=1))
+
+    return root_node.normalize_levels(0)
+
+
+def parse_markdown(
+    source: Union[str, bytes, Path],
+    filename: Optional[str] = None,
+    default_root_title: str = "موضوع اصلی",
+) -> Node:
+    raw_text = _decode_source(source)
+    lines = raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    root_node: Optional[Node] = None
+    stack: List[Tuple[Node, str, float]] = []
+    in_code_block = False
+
+    def _make_root(title: str) -> Node:
+        nonlocal root_node
+        root_node = Node(text=title, level=0)
+        stack.clear()
+        stack.append((root_node, "h", 0.0))
+        return root_node
+
+    def _nearest_heading_depth() -> float:
+        for _, kind, depth in reversed(stack):
+            if kind == "h":
+                return depth
+        return 0.0
+
+    def _find_parent_for_depth(target: float) -> Node:
+        while len(stack) > 1 and stack[-1][2] >= target:
             stack.pop()
+        return stack[-1][0]
 
-        if not stack:
-            branches.append(node)
+    def _compute_bullet_depth(heading_base: float, indent_cols: int) -> float:
+        indent_steps = max(0.0, indent_cols / float(_TAB_SIZE))
+        fractional = 0.1 + 0.8 * (indent_steps / (indent_steps + 4.0))
+        return heading_base + fractional
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+
+        if _HR_RE.match(stripped):
+            continue
+
+        hm = _HEADING_RE.match(stripped)
+        if hm:
+            hashes, content = hm.groups()
+            cleaned = clean_topic_text(content)
+            if not cleaned:
+                continue
+            depth = float(len(hashes))
+            node = Node(text=cleaned, level=int(depth) - 1)
+
+            if depth == 1.0:
+                if root_node is None:
+                    root_node = node
+                    root_node.level = 0
+                    stack.clear()
+                    stack.append((root_node, "h", 1.0))
+                else:
+                    if len(stack) >= 1 and stack[0][1] == "h" and stack[0][2] == 1.0:
+                        wrapper_title = _stem(filename, default=default_root_title)
+                        wrapper = Node(text=wrapper_title, level=0)
+                        old_root = stack[0][0]
+                        wrapper.add_child(old_root)
+                        root_node = wrapper
+                        stack[0] = (root_node, "h", 0.0)
+                    node.level = 1
+                    root_node.add_child(node)
+                    while len(stack) > 1:
+                        stack.pop()
+                    stack.append((node, "h", 1.0))
+            else:
+                if root_node is None:
+                    _make_root(_stem(filename, default=default_root_title))
+                parent = _find_parent_for_depth(depth)
+                parent.add_child(node)
+                stack.append((node, "h", depth))
+            continue
+
+        bm = _BULLET_RE.match(raw_line)
+        if bm:
+            indent_str, content = bm.groups()
+            cleaned = clean_topic_text(content)
+            if not cleaned:
+                continue
+            indent_cols = len(indent_str.expandtabs(_TAB_SIZE))
+
+            if root_node is None:
+                _make_root(_stem(filename, default=default_root_title))
+
+            heading_base = _nearest_heading_depth()
+            depth = _compute_bullet_depth(heading_base, indent_cols)
+
+            node = Node(text=cleaned, level=0)
+            parent = _find_parent_for_depth(depth)
+            parent.add_child(node)
+            stack.append((node, "b", depth))
+            continue
+
+        cleaned = clean_topic_text(stripped)
+        if not cleaned:
+            continue
+
+        leading_ws_len = len(raw_line) - len(raw_line.lstrip(" \t"))
+        indent_cols = len(raw_line[:leading_ws_len].expandtabs(_TAB_SIZE))
+
+        if root_node is None and indent_cols == 0:
+            root_node = Node(text=cleaned, level=0)
+            stack.clear()
+            stack.append((root_node, "h", 1.0))
         else:
-            stack[-1][1]["children"].append(node)
+            if root_node is None:
+                _make_root(_stem(filename, default=default_root_title))
+            heading_base = _nearest_heading_depth()
+            depth = _compute_bullet_depth(heading_base, indent_cols)
+            node = Node(text=cleaned, level=0)
+            parent = _find_parent_for_depth(depth)
+            parent.add_child(node)
+            stack.append((node, "b", depth))
 
-        stack.append((indent, node))
+    if root_node is None:
+        raise ValueError("متن ورودی خالی است یا هیچ ساختار قابل‌پردازشی ندارد.")
 
-    return central, branches
+    if (
+        len(root_node.children) == 1
+        and root_node.text == _stem(filename, default=default_root_title)
+        and stack
+        and stack[0][2] == 0.0
+    ):
+        root_node = root_node.children[0]
+
+    return root_node.normalize_levels(0)
+
+
+def parse_input(
+    content: Union[str, bytes, Path],
+    filename: Optional[str] = None,
+    default_root_title: str = "موضوع اصلی",
+) -> Node:
+    is_opml = False
+    if filename and filename.lower().endswith((".opml", ".xml")):
+        is_opml = True
+    elif isinstance(content, Path) and content.suffix.lower() in (".opml", ".xml"):
+        is_opml = True
+    else:
+        sample = _decode_source(content)[:600].lstrip()
+        if (
+            sample.startswith("<?xml")
+            or "<opml" in sample.lower()
+            or "<outline" in sample.lower()
+        ):
+            is_opml = True
+
+    if is_opml:
+        return parse_opml(
+            content, filename=filename, default_root_title=default_root_title
+        )
+    return parse_markdown(
+        content, filename=filename, default_root_title=default_root_title
+    )
