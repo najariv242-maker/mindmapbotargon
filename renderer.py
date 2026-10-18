@@ -1,13 +1,18 @@
 """
-renderer.py - Xmind Official Elbow & Rainbow-#245570 Style Renderer
-===================================================================
-Implements the exact visual and structural specification from:
-- Theme: Rainbow-#245570-MULTI_LINE_COLORS
-- Central Topic Fill: #245570 (Text: #FFFFFF, 30px, Center-aligned)
-- Main Topics: #0B5D99, #534E96, #7B4083, #A23E6A, #C34150, #CA5835 (24px, Center-aligned)
-- Subtopics: Rounded Rectangle boxes (`roundedRect`), 20px, Right-aligned
-- Branch Connection: Orthogonal 90-degree Elbow steps (`org.xmind.branchConnection.elbow`)
-- Native `.xmind` archive generator (`content.json`, `manifest.json`, `metadata.json`)
+renderer.py - Final Production Xmind Elbow & Rainbow-#245570 Renderer
+=====================================================================
+Fixes included in this complete version:
+1. Full BiDi & Mathematical Operator Isolation:
+   - Includes `>`, `<`, `%`, `=`, `/` inside `_BIDI_TOKEN_RE` so expressions like
+     `(Monthly Retention > 45%)` and `(LTV / CAC > 3.0x)` never invert.
+   - Uses `&rlm;` boundary isolation so inline English words (like `DevOps`) never
+     merge with trailing parentheticals `(Cloud Infrastructure)`.
+2. Zero Orphan-Word Wrapping:
+   - Expanded node max-widths + `display: inline-block` on `.ltr-token` so
+     parentheticals stay intact and never leave orphan words like `Chroma)` or `Connect)`.
+3. Zero-Clipping PDF & PNG Export:
+   - Resets `window.scrollTo(0, 0)` and forces exact `@media print` box sizing
+     before `page.pdf()` so top/bottom/side nodes are never clipped in PDF.
 """
 
 from __future__ import annotations
@@ -69,12 +74,12 @@ FONT_CONFIG: Dict[str, Dict[str, object]] = {
     },
 }
 
-# سایز فونت‌ها: تاپیک مرکزی ۳۰، شاخه‌های اصلی ۲۴، زیرشاخه‌ها ۲۰
+# سایز دقیق فونت‌ها طبق دستور شما
 FONT_SIZE_CENTRAL = 30
 FONT_SIZE_MAIN = 24
 FONT_SIZE_SUB = 20
 
-# پالت رنگی دقیق استخراج‌شده از Xmind (Rainbow-#245570-MULTI_LINE_COLORS)
+# پالت رنگی رسمی Xmind (Rainbow-#245570-MULTI_LINE_COLORS)
 RAINBOW_PALETTE: List[str] = [
     "#0B5D99",  # شاخه ۱: آبی کلاسیک
     "#534E96",  # شاخه ۲: نیلی / بنفش تیره
@@ -84,13 +89,13 @@ RAINBOW_PALETTE: List[str] = [
     "#CA5835",  # شاخه ۶: نارنجی گرم / کهربایی
 ]
 
-ROOT_BG = "#245570"       # سرمه‌ای نفتی رسمی Xmind
-ROOT_COLOR = "#FFFFFF"    # سفید خالص
-SUBTEXT_COLOR = "#1E293B" # سرمه‌ای تیره برای خوانایی کامل زیرشاخه‌ها
-CANVAS_BG = "#FFFFFF"     # پس‌زمینه سفید خالص مطابق Map Fill
+ROOT_BG = "#245570"
+ROOT_COLOR = "#FFFFFF"
+SUBTEXT_COLOR = "#1E293B"
+CANVAS_BG = "#FFFFFF"
 
-PAD_X = 95
-PAD_Y = 85
+PAD_X = 105
+PAD_Y = 95
 BRANCH_GAP = 68
 SIBLING_GAP = 22
 CHILD_GAP = 12
@@ -109,13 +114,14 @@ class RenderResult:
 
 
 # ---------------------------------------------------------------------------
-# BiDi & Emoji Formatter (Fixes Parentheses Mirroring & Emoji Overlap)
+# Bulletproof BiDi, Math Operator & Emoji Formatter
 # ---------------------------------------------------------------------------
 
+# شامل تمام علائم ریاضی (> < % = /) درون پرانتزها و عبارات انگلیسی
 _BIDI_TOKEN_RE = re.compile(
-    r"\([A-Za-z0-9_./+:=#&*,\-–—\%\s]+\)"
+    r"\([A-Za-z0-9_./+:=#&*,\-–—\%><!~?\s]+\)"
     r"|<[A-Za-z0-9_.:/\-]+>"
-    r"|[A-Za-z0-9][A-Za-z0-9_./+:=#&*\-]*(?:\s+[A-Za-z0-9_./+:=#&*\-]+)*"
+    r"|[A-Za-z0-9][A-Za-z0-9_./+:=#&*\-><%]*(?:\s+(?:[><=/&+\-]+\s+)?[A-Za-z0-9_./+:=#&*\-><%]+)*"
 )
 
 _EMOJI_RE = re.compile(
@@ -130,7 +136,6 @@ _EMOJI_RE = re.compile(
 
 
 def _isolate_emojis_in_escaped_text(escaped_text: str) -> str:
-    """جداسازی اموجی‌ها با فاصله ایمن تا روی حروف فارسی (مثل «🎯 مدیریت») نیفتند."""
     return _EMOJI_RE.sub(
         lambda m: f'<span class="emoji-token">{m.group(0)}</span>',
         escaped_text,
@@ -138,7 +143,11 @@ def _isolate_emojis_in_escaped_text(escaped_text: str) -> str:
 
 
 def format_bidi_html(text: str) -> str:
-    """ایزولاسیون عبارات انگلیسی، پرانتزها و اموجی‌ها در متن فارسی."""
+    """
+    ایزولاسیون کامل عبارات انگلیسی، فرمول‌های ریاضی (مثل LTV / CAC > 3.0x) و پرانتزها.
+    استفاده از `&rlm;` بیرون از تگ `<bdi>` مانع از ادغام کلمات انگلیسیِ داخل متن فارسی
+    (مثل `DevOps`) با پرانتزهای انتهایی (مثل `(Cloud Infrastructure)`) می‌شود.
+    """
     parts: List[str] = []
     last_idx = 0
 
@@ -146,6 +155,7 @@ def format_bidi_html(text: str) -> str:
         start, end = match.span()
         token = match.group(0)
 
+        # نادیده گرفتن اعداد خالص بدون حروف لاتین
         if not re.search(r"[A-Za-z()<>]", token):
             continue
 
@@ -154,7 +164,7 @@ def format_bidi_html(text: str) -> str:
             parts.append(_isolate_emojis_in_escaped_text(seg))
 
         parts.append(
-            f'<bdi class="ltr-token" dir="ltr">&lrm;{html.escape(token)}&lrm;</bdi>'
+            f'&rlm;<bdi class="ltr-token" dir="ltr">&lrm;{html.escape(token)}&lrm;</bdi>&rlm;'
         )
         last_idx = end
 
@@ -297,12 +307,6 @@ def _split_balanced(children: List[Node]) -> Tuple[List[Node], List[Node]]:
 
 
 def _node_style(level: int, color: str) -> str:
-    """
-    استایل کادرها دقیقاً منطبق با `xmind_template.json` (org.xmind.topicShape.roundedRect):
-    - سطح ۰ (تاپیک مرکزی): پس‌زمینه #245570، متن سفید، سایز ۳۰، وسط‌چین، بدون کادر اضافه.
-    - سطح ۱ (شاخه‌های اصلی): پس‌زمینه پالت ۶ رنگ، متن سفید، سایز ۲۴، وسط‌چین.
-    - سطح ۲ به بالا (زیرشاخه‌ها): کادر مستطیلی با گوشه‌های گرد و تینت ملایم هم‌رنگ شاخه، سایز ۲۰، راست‌چین.
-    """
     if level == 0:
         return (
             f"background:{ROOT_BG};border:none;"
@@ -320,7 +324,6 @@ def _node_style(level: int, color: str) -> str:
             "text-align:center;justify-content:center;"
             "box-shadow:0 2px 8px rgba(0,0,0,0.10);"
         )
-    # سطح ۲+ (Subtopic roundedRect در تم Rainbow-#245570)
     tint_bg = _hex_to_rgba(color, 0.11 if level == 2 else 0.07)
     tint_border = _hex_to_rgba(color, 0.28 if level == 2 else 0.20)
     return (
@@ -372,7 +375,6 @@ def _build_tree_html(branches: List[Node], side: str, color_offset: int) -> str:
     )
 
 
-# موتور ترسیم خطوط پله‌ای / قائمه ۹۰ درجه (org.xmind.branchConnection.elbow)
 _JS_DRAW = r"""
 window.__drawMindMap = function () {
   const existing = document.getElementById('svg-canvas');
@@ -403,10 +405,6 @@ window.__drawMindMap = function () {
     };
   }
 
-  /*
-   * ترسیم خط پله‌ای قائمه (Xmind Elbow: org.xmind.branchConnection.elbow)
-   * با گوشه‌های ۹۰ درجه استاندارد و انحنای ظریف در زاویه شکست
-   */
   function makeElbowPath(x1, y1, x2, y2, side, cornerRadius) {
     const dy = y2 - y1;
     const ady = Math.abs(dy);
@@ -440,12 +438,14 @@ window.__drawMindMap = function () {
     const pathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
 
     const x1 = (side === 'right') ? pr.right : pr.x;
-    const y1 = pr.cy;
     const x2 = (side === 'right') ? cr.x : cr.right;
     const y2 = cr.cy;
 
     if (connectionLevel === 0) {
-      /* اتصال تاپیک مرکزی به شاخه‌های اصلی: ضخامت 3pt (معادل 3.5px) و بدون Tapered */
+      /* توزیع متوازن نقطه خروج شاخه‌های اصلی روی ضلع کادر مرکزی */
+      const yOffset = Math.max(-pr.h * 0.26, Math.min(pr.h * 0.26, (cr.cy - pr.cy) * 0.22));
+      const y1 = pr.cy + yOffset;
+
       pathEl.setAttribute('d', makeElbowPath(x1, y1, x2, y2, side, 8));
       pathEl.setAttribute('fill', 'none');
       pathEl.setAttribute('stroke', color);
@@ -453,7 +453,7 @@ window.__drawMindMap = function () {
       pathEl.setAttribute('stroke-linecap', 'round');
       pathEl.setAttribute('stroke-linejoin', 'round');
     } else {
-      /* اتصال شاخه‌های اصلی به زیرشاخه‌ها: ضخامت 2pt (معادل 2.4px) پله‌ای */
+      const y1 = pr.cy;
       pathEl.setAttribute('d', makeElbowPath(x1, y1, x2, y2, side, 6));
       pathEl.setAttribute('fill', 'none');
       pathEl.setAttribute('stroke', color);
@@ -571,14 +571,15 @@ html, body {{
   white-space: normal;
   word-break: normal;
   overflow-wrap: break-word;
-  line-height: 1.55;
+  line-height: 1.6;
   z-index: 1;
 }}
 
-.node.level-0    {{ max-width: 420px; min-width: 190px; }}
-.node.level-1    {{ max-width: 330px; min-width: 140px; }}
-.node.level-2    {{ max-width: 390px; min-width: 90px;  }}
-.node.level-deep {{ max-width: 460px; min-width: 90px;  }}
+/* عرض‌های بهینه برای جلوگیری از افتادن تک‌کلمه انگلیسی به خط دوم */
+.node.level-0    {{ max-width: 460px; min-width: 200px; }}
+.node.level-1    {{ max-width: 370px; min-width: 150px; }}
+.node.level-2    {{ max-width: 450px; min-width: 95px;  }}
+.node.level-deep {{ max-width: 560px; min-width: 95px;  }}
 
 .node-inner {{
   direction: rtl;
@@ -599,15 +600,20 @@ html, body {{
   text-align: right;
 }}
 
+/* یکپارچه نگه داشتن عبارات انگلیسی داخل پرانتز بدون شکستن از وسط */
 .ltr-token {{
   direction: ltr;
   unicode-bidi: isolate;
-  display: inline;
+  display: inline-block;
+  max-width: 100%;
+  white-space: normal;
+  vertical-align: baseline;
 }}
 
 .emoji-token {{
   display: inline-block;
-  margin: 0 4px;
+  unicode-bidi: isolate;
+  margin: 0 5px;
   font-family: 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji', sans-serif;
   vertical-align: middle;
 }}
@@ -684,7 +690,7 @@ def build_mindmap_html(
 
 
 # ---------------------------------------------------------------------------
-# Native `.xmind` File Builder (Matches `xmind_template.json` Schema)
+# Native `.xmind` File Builder
 # ---------------------------------------------------------------------------
 
 
@@ -728,7 +734,6 @@ def _node_to_xmind_topic(node: Node, branch_color: Optional[str] = None) -> Dict
 
 
 def build_xmind_bytes(root: Node) -> bytes:
-    """تولید مستقیم فایل `.xmind` در حافظه رم مطابق با ساختار `xmind_template.json`."""
     root.normalize_levels(0)
     sheet_id = "sheet-root-01"
 
@@ -1000,30 +1005,40 @@ async def render_mindmap(
         await page.set_viewport_size({"width": w, "height": h})
         await page.evaluate(
             """() => new Promise(resolve => {
+                window.scrollTo(0, 0);
                 window.__drawMindMap();
                 requestAnimationFrame(resolve);
             })"""
         )
 
+        # ۱. دریافت تصویر PNG باکیفیت
         locator = page.locator("#page-root")
         png_bytes = await locator.screenshot(type="png", timeout=PAGE_TIMEOUT_MS)
 
+        # ۲. بازگرداندن اسکرول به نقطه (0, 0) و قفل کردن ابعاد صفحه برای جلوگیری از بریده شدن بالای PDF
+        pdf_w = w + 16
+        pdf_h = h + 16
         await page.evaluate(
-            f"""() => {{
+            f"""() => new Promise(resolve => {{
+                window.scrollTo(0, 0);
                 const s = document.createElement('style');
                 s.textContent =
-                    '@page {{ size: {w}px {h}px; margin: 0; }} ' +
-                    'html, body {{ width: {w}px !important; height: {h}px !important; ' +
-                    'margin: 0 !important; padding: 0 !important; overflow: hidden !important; ' +
-                    '-webkit-print-color-adjust: exact !important; ' +
+                    '@page {{ size: {pdf_w}px {pdf_h}px; margin: 0; }} ' +
+                    '@media print {{ ' +
+                    '  html, body {{ width: {pdf_w}px !important; height: {pdf_h}px !important; ' +
+                    '  margin: 0 !important; padding: 0 !important; overflow: visible !important; }} ' +
+                    '}} ' +
+                    'html, body {{ -webkit-print-color-adjust: exact !important; ' +
                     'print-color-adjust: exact !important; }}';
                 document.head.appendChild(s);
-            }}"""
+                window.__drawMindMap();
+                requestAnimationFrame(resolve);
+            }})"""
         )
 
         pdf_bytes = await page.pdf(
-            width=f"{w}px",
-            height=f"{h}px",
+            width=f"{pdf_w}px",
+            height=f"{pdf_h}px",
             print_background=True,
             page_ranges="1",
             margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
