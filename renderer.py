@@ -1,9 +1,9 @@
 """
-renderer.py - XMind-Style HTML5/CSS3 + SVG Mind Map Renderer
+renderer.py - Low-Memory, Timeout-Protected XMind Renderer for Render (512MB RAM)
 - Central Topic (Level 0): 30px, Center-aligned
 - Main Topics (Level 1): 24px, Center-aligned
 - Sub-topics (Level 2+): 20px, Right-aligned on both sides
-- Bulletproof BiDi parentheses & zero-clipping canvas measurement
+- Single-context rendering pipeline to prevent OOM freezes on Render Free Tier
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_FONTS_DIR = BASE_DIR / "fonts"
+
+PAGE_TIMEOUT_MS = 25_000  # حداکثر ۲۵ ثانیه برای هر عملیات صفحه
 
 FONT_CONFIG: Dict[str, Dict[str, object]] = {
     "font_a": {
@@ -59,6 +61,7 @@ FONT_CONFIG: Dict[str, Dict[str, object]] = {
     },
 }
 
+# سایز دقیق فونت‌ها طبق دستور شما
 FONT_SIZE_CENTRAL = 30
 FONT_SIZE_MAIN = 24
 FONT_SIZE_SUB = 20
@@ -78,12 +81,12 @@ ROOT_COLOR = "#FFFFFF"
 SUBTEXT_COLOR = "#1E293B"
 CANVAS_BG = "#F8FAFC"
 
-PAD_X = 110
-PAD_Y = 95
-BRANCH_GAP = 76
-SIBLING_GAP = 22
-CHILD_GAP = 14
-SUBTREE_GAP = 46
+PAD_X = 90
+PAD_Y = 80
+BRANCH_GAP = 72
+SIBLING_GAP = 20
+CHILD_GAP = 12
+SUBTREE_GAP = 44
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,7 @@ class RenderResult:
     font_label: str
 
 
+# تشخیص عبارات انگلیسی و پرانتزها برای جلوگیری از برعکس شدن پرانتز در متن فارسی
 _BIDI_TOKEN_RE = re.compile(
     r"\([A-Za-z0-9_./+:=#&*,\-–—\s]+\)"
     r"|<[A-Za-z0-9_.:/\-]+>"
@@ -104,6 +108,7 @@ _BIDI_TOKEN_RE = re.compile(
 
 
 def format_bidi_html(text: str) -> str:
+    """ایزولاسیون عبارات انگلیسی و پرانتزها با LRM (&lrm;) برای جلوگیری از وارونگی پرانتز."""
     parts: List[str] = []
     last_idx = 0
 
@@ -118,7 +123,7 @@ def format_bidi_html(text: str) -> str:
             parts.append(html.escape(text[last_idx:start]))
 
         parts.append(
-            f'<bdi class="ltr-token" dir="ltr">{html.escape(token)}</bdi>'
+            f'<bdi class="ltr-token" dir="ltr">&lrm;{html.escape(token)}&lrm;</bdi>'
         )
         last_idx = end
 
@@ -178,13 +183,10 @@ def _encode_font_css_cached(resolved_path_str: str, family_name: str) -> str:
         mime = "font/ttf"
 
     b64_data = base64.b64encode(font_path.read_bytes()).decode("ascii")
-    file_uri = font_path.as_uri()
-
     return (
         f"@font-face {{\n"
         f"  font-family: '{family_name}';\n"
-        f"  src: url('data:{mime};base64,{b64_data}') format('{fmt}'),\n"
-        f"       url('{file_uri}') format('{fmt}');\n"
+        f"  src: url('data:{mime};base64,{b64_data}') format('{fmt}');\n"
         f"  font-weight: 100 900;\n"
         f"  font-style: normal;\n"
         f"  font-display: block;\n"
@@ -203,16 +205,7 @@ def build_font_face_css(
     if resolved is not None:
         return family_name, _encode_font_css_cached(str(resolved), family_name)
 
-    fallback_uri = (target_dir / str(cfg["filename"])).resolve().as_uri()
-    css = (
-        f"@font-face {{\n"
-        f"  font-family: '{family_name}';\n"
-        f"  src: url('{fallback_uri}') format('truetype');\n"
-        f"  font-weight: 100 900;\n"
-        f"  font-style: normal;\n"
-        f"}}"
-    )
-    return family_name, css
+    return family_name, ""
 
 
 def _count_descendants(node: Node) -> int:
@@ -470,7 +463,7 @@ _HTML_TEMPLATE = """\
 html, body {{
   direction: ltr;
   background: {canvas_bg};
-  font-family: '{font_family}', 'Vazirmatn', 'Tahoma', 'Arial Unicode MS', sans-serif;
+  font-family: '{font_family}', 'Tahoma', sans-serif;
   overflow: visible;
   width: max-content;
   height: max-content;
@@ -555,21 +548,23 @@ html, body {{
   width: 100%;
 }}
 
+/* وسط‌چین شدن تاپیک مرکزی (۳۰) و تاپیک‌های اصلی (۲۴) */
 .node.level-0 .node-inner,
 .node.level-1 .node-inner {{
   text-align: center;
 }}
 
+/* راست‌چین شدن تمام زیرشاخه‌ها (۲۰) در هر دو سمت چپ و راست */
 .node.level-2 .node-inner,
 .node.level-deep .node-inner {{
   text-align: right;
 }}
 
+/* حفظ جریان طبیعی عبارات انگلیسی و پرانتزها در دل متن فارسی */
 .ltr-token {{
   direction: ltr;
   unicode-bidi: isolate;
-  display: inline-block;
-  white-space: normal;
+  display: inline;
 }}
 
 #svg-canvas {{
@@ -665,41 +660,64 @@ class BrowserManager:
                     logger.warning("Could not pre-warm font '%s': %s", f_key, exc)
 
             if cls._browser is None or not cls._browser.is_connected():
-                from playwright.async_api import async_playwright
+                await cls._force_restart_browser()
 
-                if cls._playwright is not None:
-                    try:
-                        await cls._playwright.stop()
-                    except Exception:
-                        pass
+    @classmethod
+    async def _force_restart_browser(cls) -> None:
+        from playwright.async_api import async_playwright
 
-                cls._playwright = await async_playwright().start()
-                cls._browser = await cls._playwright.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--font-render-hinting=none",
-                        "--force-color-profile=srgb",
-                    ],
-                )
-                logger.info("Headless Chromium initialized and font cache warmed.")
+        if cls._browser is not None:
+            try:
+                await cls._browser.close()
+            except Exception:
+                pass
+            cls._browser = None
+
+        if cls._playwright is not None:
+            try:
+                await cls._playwright.stop()
+            except Exception:
+                pass
+            cls._playwright = None
+
+        cls._playwright = await async_playwright().start()
+        cls._browser = await cls._playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--font-render-hinting=none",
+                "--force-color-profile=srgb",
+                "--js-flags=--max-old-space-size=256",
+            ],
+        )
+        logger.info("Headless Chromium launched with low-memory flags.")
 
     @classmethod
     async def new_context(
         cls,
         scale: float = 1.0,
-        vw: int = 12000,
-        vh: int = 8000,
+        vw: int = 1400,
+        vh: int = 900,
     ):
-        if cls._browser is None or not cls._browser.is_connected():
-            await cls.initialize()
-        return await cls._browser.new_context(
-            viewport={"width": vw, "height": vh},
-            device_scale_factor=scale,
-        )
+        async with cls._get_lock():
+            if cls._browser is None or not cls._browser.is_connected():
+                await cls._force_restart_browser()
+            try:
+                return await cls._browser.new_context(
+                    viewport={"width": vw, "height": vh},
+                    device_scale_factor=scale,
+                )
+            except Exception:
+                await cls._force_restart_browser()
+                return await cls._browser.new_context(
+                    viewport={"width": vw, "height": vh},
+                    device_scale_factor=scale,
+                )
 
     @classmethod
     async def shutdown(cls) -> None:
@@ -718,41 +736,79 @@ class BrowserManager:
                 cls._playwright = None
 
 
-async def _load_and_draw(page, html_content: str) -> None:
-    await page.set_content(html_content, wait_until="domcontentloaded")
-    await page.evaluate("() => document.fonts ? document.fonts.ready : Promise.resolve()")
-    await page.evaluate(
-        """() => new Promise(resolve => {
-            window.__drawMindMap();
-            requestAnimationFrame(() => requestAnimationFrame(resolve));
-        })"""
+async def render_mindmap(
+    root: Node,
+    font_key: str = "font_a",
+    fonts_dir: Optional[Path] = None,
+) -> RenderResult:
+    """
+    Single-Pass Low-Memory Render Pipeline:
+    1. Opens a lightweight viewport (1400x900) with scale=1.75 (fits easily in 512MB RAM).
+    2. Loads HTML once, waits for fonts (with timeout), draws SVG, and measures exact size.
+    3. Resizes viewport to exact bounding box, captures high-res PNG, then exports Vector PDF.
+    """
+    normalized_key = font_key if font_key in FONT_CONFIG else "font_a"
+    font_label = str(FONT_CONFIG[normalized_key]["button_label"])
+
+    html_content = build_mindmap_html(
+        root=root, font_key=normalized_key, fonts_dir=fonts_dir
     )
 
+    # انتخاب مقیاس هوشمند بر اساس تعداد گره‌ها برای جلوگیری از پر شدن رم ۵۱۲ مگابایتی Render
+    total_nodes = root.count_nodes()
+    scale = 2.0 if total_nodes <= 35 else 1.6
 
-async def _measure_and_export_pdf(
-    html_content: str,
-) -> Tuple[int, int, bytes]:
-    ctx = await BrowserManager.new_context(scale=1.0, vw=14000, vh=10000)
+    ctx = await BrowserManager.new_context(scale=scale, vw=1400, vh=900)
     try:
         page = await ctx.new_page()
-        await _load_and_draw(page, html_content)
+        page.set_default_timeout(PAGE_TIMEOUT_MS)
 
-        dims = await page.evaluate(
-            """() => {
-                const el = document.getElementById('page-root');
-                const r  = el.getBoundingClientRect();
-                return {
-                    w: Math.ceil(Math.max(r.width, el.scrollWidth)),
-                    h: Math.ceil(Math.max(r.height, el.scrollHeight))
-                };
-            }"""
+        await page.set_content(
+            html_content,
+            wait_until="domcontentloaded",
+            timeout=PAGE_TIMEOUT_MS,
         )
-        w = max(600, int(dims["w"]))
-        h = max(400, int(dims["h"]))
+
+        # انتظار برای فونت‌ها با سقف زمانی مشخص (عدم فریز در صورت تاخیر فونت)
+        try:
+            await asyncio.wait_for(
+                page.evaluate("() => document.fonts ? document.fonts.ready : Promise.resolve()"),
+                timeout=8.0,
+            )
+        except Exception:
+            logger.warning("Font ready wait timed out; continuing render.")
+
+        # ترسیم اولیه و اندازه‌گیری دقیق کل نقشه
+        dims = await page.evaluate(
+            """() => new Promise(resolve => {
+                window.__drawMindMap();
+                requestAnimationFrame(() => {
+                    const el = document.getElementById('page-root');
+                    const r  = el.getBoundingClientRect();
+                    resolve({
+                        w: Math.ceil(Math.max(r.width, el.scrollWidth)),
+                        h: Math.ceil(Math.max(r.height, el.scrollHeight))
+                    });
+                });
+            })"""
+        )
+
+        w = max(600, min(7000, int(dims["w"])))
+        h = max(400, min(7000, int(dims["h"])))
 
         await page.set_viewport_size({"width": w, "height": h})
-        await page.evaluate("() => window.__drawMindMap && window.__drawMindMap()")
+        await page.evaluate(
+            """() => new Promise(resolve => {
+                window.__drawMindMap();
+                requestAnimationFrame(resolve);
+            })"""
+        )
 
+        # ۱. دریافت تصویر PNG باکیفیت
+        locator = page.locator("#page-root")
+        png_bytes = await locator.screenshot(type="png", timeout=PAGE_TIMEOUT_MS)
+
+        # ۲. دریافت فایل Vector PDF در همان صفحه (بدون باز کردن مجدد مرورگر)
         await page.evaluate(
             f"""() => {{
                 const s = document.createElement('style');
@@ -773,56 +829,20 @@ async def _measure_and_export_pdf(
             page_ranges="1",
             margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
         )
-        return w, h, pdf_bytes
+
+        px_w = round(w * scale)
+        px_h = round(h * scale)
+
+        return RenderResult(
+            png_bytes=png_bytes,
+            pdf_bytes=pdf_bytes,
+            width=px_w,
+            height=px_h,
+            font_key=normalized_key,
+            font_label=font_label,
+        )
     finally:
-        await ctx.close()
-
-
-async def _export_hires_png(
-    html_content: str,
-    w: int,
-    h: int,
-    scale: float,
-) -> bytes:
-    ctx = await BrowserManager.new_context(scale=scale, vw=w, vh=h)
-    try:
-        page = await ctx.new_page()
-        await _load_and_draw(page, html_content)
-        locator = page.locator("#page-root")
-        return await locator.screenshot(type="png")
-    finally:
-        await ctx.close()
-
-
-async def render_mindmap(
-    root: Node,
-    font_key: str = "font_a",
-    fonts_dir: Optional[Path] = None,
-) -> RenderResult:
-    normalized_key = font_key if font_key in FONT_CONFIG else "font_a"
-    font_label = str(FONT_CONFIG[normalized_key]["button_label"])
-
-    html_content = build_mindmap_html(
-        root=root, font_key=normalized_key, fonts_dir=fonts_dir
-    )
-
-    w, h, pdf_bytes = await _measure_and_export_pdf(html_content)
-
-    scale = 1.0
-    for candidate in (3.0, 2.5, 2.0, 1.5, 1.0):
-        if max(w, h) * candidate <= 14500:
-            scale = candidate
-            break
-
-    png_bytes = await _export_hires_png(html_content, w, h, scale)
-    px_w = round(w * scale)
-    px_h = round(h * scale)
-
-    return RenderResult(
-        png_bytes=png_bytes,
-        pdf_bytes=pdf_bytes,
-        width=px_w,
-        height=px_h,
-        font_key=normalized_key,
-        font_label=font_label,
-    )
+        try:
+            await ctx.close()
+        except Exception:
+            pass
