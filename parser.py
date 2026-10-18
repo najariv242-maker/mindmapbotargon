@@ -1,828 +1,309 @@
 """
-renderer.py - XMind-Style HTML5/CSS3 + SVG Mind Map Renderer
-- Central Topic (Level 0): 30px, Center-aligned
-- Main Topics (Level 1): 24px, Center-aligned
-- Sub-topics (Level 2+): 20px, Right-aligned on both sides
-- Bulletproof BiDi parentheses & zero-clipping canvas measurement
+parser.py - Unified OPML & Markdown to Mind Map Tree Converter
 """
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import functools
-import html
 import logging
+import os
 import re
-from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-from parser import Node
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_FONTS_DIR = BASE_DIR / "fonts"
 
-FONT_CONFIG: Dict[str, Dict[str, object]] = {
-    "font_a": {
-        "id": "font_a",
-        "button_label": "🅰️ فونت فرهنگ ۲ (Farhang2)",
-        "family_name": "MindMapCustomFontA",
-        "filename": "Font_Option_1.ttf",
-        "fallback_woff2": "Font_Option_1.woff2",
-        "aliases": [
-            "Farhang2-Regular.ttf",
-            "Farhang2.ttf",
-            "Farhang2.woff2",
-            "Font_A.ttf",
-            "Font_A.woff2",
-        ],
-    },
-    "font_b": {
-        "id": "font_b",
-        "button_label": "🅱️ فونت پینار / وزیرمتن (Pinar / Vazirmatn)",
-        "family_name": "MindMapCustomFontB",
-        "filename": "Font_Option_2.ttf",
-        "fallback_woff2": "Font_Option_2.woff2",
-        "aliases": [
-            "Pinar-Regular.ttf",
-            "Pinar.ttf",
-            "Pinar.woff2",
-            "Vazirmatn-Regular.ttf",
-            "Vazirmatn.ttf",
-            "Vazirmatn.woff2",
-            "Font_B.ttf",
-            "Font_B.woff2",
-        ],
-    },
-}
+@dataclass
+class Node:
+    text: str
+    level: int = 0
+    children: List["Node"] = field(default_factory=list)
 
-FONT_SIZE_CENTRAL = 30
-FONT_SIZE_MAIN = 24
-FONT_SIZE_SUB = 20
+    def add_child(self, child: "Node") -> "Node":
+        child.level = self.level + 1
+        self.children.append(child)
+        return child
 
-RAINBOW_PALETTE: List[str] = [
-    "#EF476F",
-    "#F77F00",
-    "#D97706",
-    "#10B981",
-    "#2563EB",
-    "#7C3AED",
+    def normalize_levels(self, current_level: int = 0) -> "Node":
+        self.level = current_level
+        for child in self.children:
+            child.normalize_levels(current_level + 1)
+        return self
+
+    def count_nodes(self) -> int:
+        return 1 + sum(child.count_nodes() for child in self.children)
+
+
+_TAB_SIZE = 2
+
+_INLINE_MD_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\*\*(.+?)\*\*"), r"\1"),
+    (re.compile(r"__(.+?)__"), r"\1"),
+    (re.compile(r"`([^`]+)`"), r"\1"),
+    (re.compile(r"~~(.+?)~~"), r"\1"),
+    (re.compile(r"!\[([^\]]*)\]\([^)]+\)"), r"\1"),
+    (re.compile(r"\[([^\]]+)\]\([^)]+\)"), r"\1"),
 ]
 
-ROOT_BG = "#1E1E2E"
-ROOT_BORDER = "#7C3AED"
-ROOT_COLOR = "#FFFFFF"
-SUBTEXT_COLOR = "#1E293B"
-CANVAS_BG = "#F8FAFC"
-
-PAD_X = 110
-PAD_Y = 95
-BRANCH_GAP = 76
-SIBLING_GAP = 22
-CHILD_GAP = 14
-SUBTREE_GAP = 46
-
-
-@dataclass(frozen=True)
-class RenderResult:
-    png_bytes: bytes
-    pdf_bytes: bytes
-    width: int
-    height: int
-    font_key: str
-    font_label: str
-
-
-_BIDI_TOKEN_RE = re.compile(
-    r"\([A-Za-z0-9_./+:=#&*,\-–—\s]+\)"
-    r"|<[A-Za-z0-9_.:/\-]+>"
-    r"|[A-Za-z0-9][A-Za-z0-9_./+:=#&*\-]*(?:\s+[A-Za-z0-9_./+:=#&*\-]+)*"
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_BULLET_RE = re.compile(
+    r"^([ \t]*)(?:[-*+•]|(?:\d+|[۰-۹]+)[.\)])\s+(.+)$"
 )
+_HR_RE = re.compile(r"^([-*_])\1{2,}$")
 
 
-def format_bidi_html(text: str) -> str:
-    parts: List[str] = []
-    last_idx = 0
+def clean_topic_text(raw_text: str) -> str:
+    text = raw_text.strip()
+    for pattern, replacement in _INLINE_MD_PATTERNS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
 
-    for match in _BIDI_TOKEN_RE.finditer(text):
-        start, end = match.span()
-        token = match.group(0)
 
-        if not re.search(r"[A-Za-z()<>]", token):
-            continue
+def _stem(filename: Optional[str], default: str = "موضوع اصلی") -> str:
+    if not filename:
+        return default
+    base = os.path.splitext(os.path.basename(filename))[0]
+    cleaned = clean_topic_text(base.replace("_", " ").replace("-", " "))
+    return cleaned or default
 
-        if start > last_idx:
-            parts.append(html.escape(text[last_idx:start]))
 
-        parts.append(
-            f'<bdi class="ltr-token" dir="ltr">{html.escape(token)}</bdi>'
+def _decode_source(source: Union[str, bytes, Path]) -> str:
+    if isinstance(source, Path):
+        return source.read_text(encoding="utf-8-sig", errors="replace")
+    if isinstance(source, bytes):
+        return source.decode("utf-8-sig", errors="replace")
+    return str(source).lstrip("\ufeff")
+
+
+def parse_opml(
+    source: Union[str, bytes, Path],
+    filename: Optional[str] = None,
+    default_root_title: str = "موضوع اصلی",
+) -> Node:
+    xml_text = _decode_source(source).strip()
+    if not xml_text:
+        raise ValueError("فایل OPML خالی است.")
+
+    try:
+        root_elem = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(f"ساختار فایل OPML/XML نامعتبر است: {exc}") from exc
+
+    body_elem = root_elem.find("body")
+    if body_elem is None:
+        for child in root_elem:
+            if child.tag.lower().endswith("body"):
+                body_elem = child
+                break
+    if body_elem is None:
+        body_elem = root_elem
+
+    def _outline_to_node(elem: ET.Element, level: int) -> Node:
+        label = (
+            elem.attrib.get("text")
+            or elem.attrib.get("title")
+            or elem.attrib.get("name")
+            or (elem.text.strip() if elem.text else "")
         )
-        last_idx = end
+        cleaned_label = clean_topic_text(label) if label else "بدون عنوان"
+        node = Node(text=cleaned_label or "بدون عنوان", level=level)
+        for child_elem in elem:
+            if child_elem.tag.lower().endswith("outline"):
+                node.children.append(_outline_to_node(child_elem, level + 1))
+        return node
 
-    if last_idx < len(text):
-        parts.append(html.escape(text[last_idx:]))
-
-    return "".join(parts)
-
-
-def _resolve_font_file(font_key: str, fonts_dir: Path) -> Optional[Path]:
-    cfg = FONT_CONFIG.get(font_key, FONT_CONFIG["font_a"])
-    search_dirs = [fonts_dir, BASE_DIR / "font", DEFAULT_FONTS_DIR]
-
-    candidate_names: List[str] = [
-        str(cfg["filename"]),
-        str(cfg["fallback_woff2"]),
+    top_outlines = [
+        el for el in body_elem if el.tag.lower().endswith("outline")
     ]
-    aliases = cfg.get("aliases", [])
-    if isinstance(aliases, list):
-        candidate_names.extend(str(a) for a in aliases)
+    if not top_outlines:
+        raise ValueError("هیچ گره <outline> در فایل OPML یافت نشد.")
 
-    for directory in search_dirs:
-        if not directory.is_dir():
+    if len(top_outlines) == 1:
+        root_node = _outline_to_node(top_outlines[0], level=0)
+        return root_node.normalize_levels(0)
+
+    head_title: Optional[str] = None
+    for child in root_elem:
+        if child.tag.lower().endswith("head"):
+            for sub in child:
+                if sub.tag.lower().endswith("title") and sub.text and sub.text.strip():
+                    head_title = clean_topic_text(sub.text)
+                    break
+
+    fallback_title = head_title or _stem(filename, default=default_root_title)
+    root_node = Node(text=fallback_title, level=0)
+    for outline_el in top_outlines:
+        root_node.add_child(_outline_to_node(outline_el, level=1))
+
+    return root_node.normalize_levels(0)
+
+
+def parse_markdown(
+    source: Union[str, bytes, Path],
+    filename: Optional[str] = None,
+    default_root_title: str = "موضوع اصلی",
+) -> Node:
+    raw_text = _decode_source(source)
+    lines = raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    root_node: Optional[Node] = None
+    stack: List[Tuple[Node, str, float]] = []
+    in_code_block = False
+
+    def _make_root(title: str) -> Node:
+        nonlocal root_node
+        root_node = Node(text=title, level=0)
+        stack.clear()
+        stack.append((root_node, "h", 0.0))
+        return root_node
+
+    def _nearest_heading_depth() -> float:
+        for _, kind, depth in reversed(stack):
+            if kind == "h":
+                return depth
+        return 0.0
+
+    def _find_parent_for_depth(target: float) -> Node:
+        while len(stack) > 1 and stack[-1][2] >= target:
+            stack.pop()
+        return stack[-1][0]
+
+    def _compute_bullet_depth(heading_base: float, indent_cols: int) -> float:
+        indent_steps = max(0.0, indent_cols / float(_TAB_SIZE))
+        fractional = 0.1 + 0.8 * (indent_steps / (indent_steps + 4.0))
+        return heading_base + fractional
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
             continue
-        for name in candidate_names:
-            candidate_path = directory / name
-            if candidate_path.is_file():
-                return candidate_path.resolve()
 
-    for directory in search_dirs:
-        if not directory.is_dir():
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
             continue
-        all_fonts = sorted(
-            p
-            for p in directory.iterdir()
-            if p.is_file() and p.suffix.lower() in (".woff2", ".ttf", ".otf")
-        )
-        if all_fonts:
-            idx = 0 if font_key == "font_a" else min(1, len(all_fonts) - 1)
-            return all_fonts[idx].resolve()
-
-    return None
-
-
-@functools.lru_cache(maxsize=8)
-def _encode_font_css_cached(resolved_path_str: str, family_name: str) -> str:
-    font_path = Path(resolved_path_str)
-    ext = font_path.suffix.lower().lstrip(".")
-    if ext == "woff2":
-        fmt = "woff2"
-        mime = "font/woff2"
-    elif ext == "otf":
-        fmt = "opentype"
-        mime = "font/otf"
-    else:
-        fmt = "truetype"
-        mime = "font/ttf"
-
-    b64_data = base64.b64encode(font_path.read_bytes()).decode("ascii")
-    file_uri = font_path.as_uri()
-
-    return (
-        f"@font-face {{\n"
-        f"  font-family: '{family_name}';\n"
-        f"  src: url('data:{mime};base64,{b64_data}') format('{fmt}'),\n"
-        f"       url('{file_uri}') format('{fmt}');\n"
-        f"  font-weight: 100 900;\n"
-        f"  font-style: normal;\n"
-        f"  font-display: block;\n"
-        f"}}"
-    )
-
-
-def build_font_face_css(
-    font_key: str, fonts_dir: Optional[Path] = None
-) -> Tuple[str, str]:
-    target_dir = Path(fonts_dir) if fonts_dir else DEFAULT_FONTS_DIR
-    cfg = FONT_CONFIG.get(font_key, FONT_CONFIG["font_a"])
-    family_name = str(cfg["family_name"])
-
-    resolved = _resolve_font_file(font_key, target_dir)
-    if resolved is not None:
-        return family_name, _encode_font_css_cached(str(resolved), family_name)
-
-    fallback_uri = (target_dir / str(cfg["filename"])).resolve().as_uri()
-    css = (
-        f"@font-face {{\n"
-        f"  font-family: '{family_name}';\n"
-        f"  src: url('{fallback_uri}') format('truetype');\n"
-        f"  font-weight: 100 900;\n"
-        f"  font-style: normal;\n"
-        f"}}"
-    )
-    return family_name, css
-
-
-def _count_descendants(node: Node) -> int:
-    return sum(1 + _count_descendants(c) for c in node.children)
-
-
-def _split_balanced(children: List[Node]) -> Tuple[List[Node], List[Node]]:
-    n = len(children)
-    if n == 0:
-        return [], []
-    if n == 1:
-        return children[:], []
-
-    weights = [1 + _count_descendants(c) for c in children]
-    total_w = sum(weights)
-    target = total_w / 2.0
-
-    best_k = 1
-    best_diff = float("inf")
-    running_w = 0
-    for k in range(1, n):
-        running_w += weights[k - 1]
-        diff = abs(running_w - target)
-        if diff < best_diff:
-            best_diff = diff
-            best_k = k
-
-    return children[:best_k], children[best_k:]
-
-
-def _node_style(level: int, color: str) -> str:
-    if level == 0:
-        return (
-            f"background:{ROOT_BG};border:3px solid {ROOT_BORDER};"
-            f"color:{ROOT_COLOR};border-radius:26px;"
-            "padding:18px 34px;"
-            f"font-size:{FONT_SIZE_CENTRAL}px;font-weight:700;"
-            "text-align:center;justify-content:center;"
-            "box-shadow:0 6px 24px rgba(124,58,237,0.28);"
-        )
-    if level == 1:
-        return (
-            f"background:{color};color:#FFFFFF;"
-            "border-radius:20px;padding:12px 26px;"
-            f"font-size:{FONT_SIZE_MAIN}px;font-weight:600;"
-            "text-align:center;justify-content:center;"
-            "text-shadow:0 1px 2px rgba(0,0,0,0.18);"
-            "box-shadow:0 3px 12px rgba(0,0,0,0.14);"
-        )
-    return (
-        "background:transparent;"
-        f"color:{SUBTEXT_COLOR};"
-        "padding:6px 14px 9px 14px;"
-        f"font-size:{FONT_SIZE_SUB}px;font-weight:500;"
-        "text-align:right;justify-content:flex-start;"
-    )
-
-
-def _build_branch_html(node: Node, color: str, side: str) -> str:
-    level = node.level
-    n_style = _node_style(level, color)
-    safe_bidi_html = format_bidi_html(node.text)
-    depth_cls = f"level-{level}" if level <= 2 else f"level-{level} level-deep"
-
-    node_div = (
-        f'<div class="node {depth_cls}" '
-        f'data-level="{level}" data-color="{color}" data-side="{side}" '
-        f'style="{n_style}">'
-        f'<div class="node-inner" dir="rtl">{safe_bidi_html}</div>'
-        f"</div>"
-    )
-
-    if node.children:
-        ch_html = "\n".join(
-            _build_branch_html(c, color, side) for c in node.children
-        )
-        children_div = f'<div class="branch-children">{ch_html}</div>'
-    else:
-        children_div = '<div class="branch-children"></div>'
-
-    return (
-        f'<div class="branch-group" data-color="{color}" data-side="{side}">'
-        f"{node_div}{children_div}"
-        f"</div>"
-    )
-
-
-def _build_tree_html(branches: List[Node], side: str, color_offset: int) -> str:
-    return "\n".join(
-        _build_branch_html(
-            b, RAINBOW_PALETTE[(color_offset + i) % len(RAINBOW_PALETTE)], side
-        )
-        for i, b in enumerate(branches)
-    )
-
-
-_JS_DRAW = r"""
-window.__drawMindMap = function () {
-  const existing = document.getElementById('svg-canvas');
-  if (existing) existing.remove();
-
-  const wrapper = document.getElementById('mindmap-wrapper');
-  const wRect = wrapper.getBoundingClientRect();
-
-  const svg = document.createElementNS('[http://www.w3.org/2000/svg](http://www.w3.org/2000/svg)', 'svg');
-  svg.id = 'svg-canvas';
-  svg.setAttribute('width', Math.ceil(wRect.width));
-  svg.setAttribute('height', Math.ceil(wRect.height));
-  svg.style.cssText =
-    'position:absolute;top:0;left:0;overflow:visible;' +
-    'pointer-events:none;z-index:0;';
-  wrapper.insertBefore(svg, wrapper.firstChild);
-
-  function toLocal(r) {
-    return {
-      x: r.left - wRect.left,
-      y: r.top - wRect.top,
-      w: r.width,
-      h: r.height,
-      cx: r.left - wRect.left + r.width / 2,
-      cy: r.top - wRect.top + r.height / 2,
-      right: r.right - wRect.left,
-      bottom: r.bottom - wRect.top,
-    };
-  }
-
-  function getParentAnchorY(pr, parentLevel) {
-    return (parentLevel >= 2) ? pr.bottom : pr.cy;
-  }
-
-  function makeTaperedPath(x1, y1, x2, y2, w1, w2) {
-    const dx = x2 - x1;
-    const cx1 = x1 + dx * 0.5, cy1 = y1;
-    const cx2 = x2 - dx * 0.5, cy2 = y2;
-
-    let chx = x2 - x1, chy = y2 - y1;
-    const chl = Math.hypot(chx, chy) || 1;
-    chx /= chl; chy /= chl;
-    const nmx = -chy, nmy = chx;
-
-    let t0x = cx1 - x1, t0y = cy1 - y1;
-    const l0 = Math.hypot(t0x, t0y) || 1;
-    t0x /= l0; t0y /= l0;
-    const n0x = -t0y, n0y = t0x;
-
-    let t1x = x2 - cx2, t1y = y2 - cy2;
-    const l1 = Math.hypot(t1x, t1y) || 1;
-    t1x /= l1; t1y /= l1;
-    const n1x = -t1y, n1y = t1x;
-
-    const h0 = w1 / 2;
-    const hm = (w1 + w2) / 4;
-    const h1 = w2 / 2;
-
-    const ox1  = x1  + n0x * h0, oy1  = y1  + n0y * h0;
-    const ocx1 = cx1 + nmx * hm, ocy1 = cy1 + nmy * hm;
-    const ocx2 = cx2 + nmx * hm, ocy2 = cy2 + nmy * hm;
-    const ox2  = x2  + n1x * h1, oy2  = y2  + n1y * h1;
-
-    const ix1  = x1  - n0x * h0, iy1  = y1  - n0y * h0;
-    const icx1 = cx1 - nmx * hm, icy1 = cy1 - nmy * hm;
-    const icx2 = cx2 - nmx * hm, icy2 = cy2 - nmy * hm;
-    const ix2  = x2  - n1x * h1, iy2  = y2  - n1y * h1;
-
-    return (
-      `M ${ox1},${oy1} ` +
-      `C ${ocx1},${ocy1} ${ocx2},${ocy2} ${ox2},${oy2} ` +
-      `L ${ix2},${iy2} ` +
-      `C ${icx2},${icy2} ${icx1},${icy1} ${ix1},${iy1} Z`
-    );
-  }
-
-  function makeContinuousUnderlinePath(x1, y1, x2_inner, y2, x2_outer) {
-    const dx = x2_inner - x1;
-    const cx1 = x1 + dx * 0.5;
-    const cx2 = x2_inner - dx * 0.5;
-    return (
-      `M ${x1},${y1} ` +
-      `C ${cx1},${y1} ${cx2},${y2} ${x2_inner},${y2} ` +
-      `L ${x2_outer},${y2}`
-    );
-  }
-
-  function drawCurve(parentEl, childEl, side, connectionLevel, color) {
-    const pr = toLocal(parentEl.getBoundingClientRect());
-    const cr = toLocal(childEl.getBoundingClientRect());
-
-    const parentLevel = parseInt(parentEl.dataset.level || '0', 10);
-    const childLevel  = parseInt(childEl.dataset.level  || '0', 10);
-
-    const pathEl = document.createElementNS('[http://www.w3.org/2000/svg](http://www.w3.org/2000/svg)', 'path');
-
-    if (connectionLevel === 0) {
-      const x1 = (side === 'right') ? pr.right : pr.x;
-      const yShift = Math.max(-pr.h * 0.22, Math.min(pr.h * 0.22, (cr.cy - pr.cy) * 0.20));
-      const y1 = pr.cy + yShift;
-      const x2 = (side === 'right') ? cr.x : cr.right;
-      const y2 = cr.cy;
-
-      pathEl.setAttribute('d', makeTaperedPath(x1, y1, x2, y2, 9, 3.2));
-      pathEl.setAttribute('fill', color);
-      pathEl.setAttribute('stroke', 'none');
-    } else {
-      const x1 = (side === 'right') ? pr.right : pr.x;
-      const y1 = getParentAnchorY(pr, parentLevel);
-      const x2_inner = (side === 'right') ? cr.x : cr.right;
-      const x2_outer = (side === 'right') ? cr.right : cr.x;
-      const y2 = (childLevel >= 2) ? cr.bottom : cr.cy;
-
-      pathEl.setAttribute('d', makeContinuousUnderlinePath(x1, y1, x2_inner, y2, x2_outer));
-      pathEl.setAttribute('fill', 'none');
-      pathEl.setAttribute('stroke', color);
-      pathEl.setAttribute('stroke-width', '2.6');
-      pathEl.setAttribute('stroke-linecap', 'round');
-      pathEl.setAttribute('stroke-linejoin', 'round');
-    }
-
-    svg.appendChild(pathEl);
-  }
-
-  function traverse(bgEl, parentNodeEl, side, connectionLevel) {
-    const nodeEl = bgEl.querySelector(':scope > .node');
-    const color  = bgEl.dataset.color;
-    if (parentNodeEl && nodeEl) {
-      drawCurve(parentNodeEl, nodeEl, side, connectionLevel, color);
-    }
-    const childrenEl = bgEl.querySelector(':scope > .branch-children');
-    if (childrenEl && nodeEl) {
-      childrenEl.querySelectorAll(':scope > .branch-group').forEach(child => {
-        traverse(child, nodeEl, side, connectionLevel + 1);
-      });
-    }
-  }
-
-  const rootEl = document.querySelector('.central-node');
-  document.querySelectorAll('.right-tree > .branch-group').forEach(bg => {
-    traverse(bg, rootEl, 'right', 0);
-  });
-  document.querySelectorAll('.left-tree > .branch-group').forEach(bg => {
-    traverse(bg, rootEl, 'left', 0);
-  });
-};
-"""
-
-_HTML_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="fa">
-<head>
-<meta charset="UTF-8">
-<style>
-{font_face_css}
-
-*, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
-html, body {{
-  direction: ltr;
-  background: {canvas_bg};
-  font-family: '{font_family}', 'Vazirmatn', 'Tahoma', 'Arial Unicode MS', sans-serif;
-  overflow: visible;
-  width: max-content;
-  height: max-content;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: geometricPrecision;
-}}
-
-#page-root {{
-  direction: ltr;
-  display: inline-block;
-  padding: {pad_y}px {pad_x}px;
-  background: {canvas_bg};
-  width: max-content;
-  height: max-content;
-}}
-
-#mindmap-wrapper {{
-  direction: ltr;
-  display: inline-flex;
-  flex-direction: row;
-  align-items: center;
-  gap: {branch_gap}px;
-  position: relative;
-  width: max-content;
-}}
-
-.tree {{
-  direction: ltr;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  justify-content: center;
-  gap: {sibling_gap}px;
-}}
-.left-tree {{ align-items: flex-end; }}
-
-.branch-group {{
-  direction: ltr;
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: {subtree_gap}px;
-}}
-.left-tree .branch-group {{
-  flex-direction: row-reverse;
-}}
-
-.branch-children {{
-  direction: ltr;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  justify-content: center;
-  gap: {child_gap}px;
-}}
-.left-tree .branch-children {{
-  align-items: flex-end;
-}}
-
-.node {{
-  position: relative;
-  display: flex;
-  align-items: center;
-  direction: rtl;
-  unicode-bidi: isolate;
-  white-space: normal;
-  word-break: normal;
-  overflow-wrap: break-word;
-  line-height: 1.55;
-  z-index: 1;
-}}
-
-.node.level-0    {{ max-width: 400px; min-width: 180px; }}
-.node.level-1    {{ max-width: 320px; min-width: 140px; }}
-.node.level-2    {{ max-width: 380px; min-width: 80px;  }}
-.node.level-deep {{ max-width: 450px; min-width: 80px;  }}
-
-.node-inner {{
-  direction: rtl;
-  unicode-bidi: isolate;
-  display: block;
-  width: 100%;
-}}
-
-.node.level-0 .node-inner,
-.node.level-1 .node-inner {{
-  text-align: center;
-}}
-
-.node.level-2 .node-inner,
-.node.level-deep .node-inner {{
-  text-align: right;
-}}
-
-.ltr-token {{
-  direction: ltr;
-  unicode-bidi: isolate;
-  display: inline-block;
-  white-space: normal;
-}}
-
-#svg-canvas {{
-  position: absolute;
-  top: 0;
-  left: 0;
-  overflow: visible;
-  pointer-events: none;
-  z-index: 0;
-}}
-</style>
-</head>
-<body>
-<div id="page-root">
-  <div id="mindmap-wrapper">
-
-{left_tree_html}
-
-    <div class="central-node node level-0"
-         data-level="0"
-         style="{root_style}">
-      <div class="node-inner" dir="rtl">{root_text}</div>
-    </div>
-
-    <div class="right-tree tree">
-{right_html}
-    </div>
-
-  </div>
-</div>
-<script>
-{js_draw}
-</script>
-</body>
-</html>
-"""
-
-
-def build_mindmap_html(
-    root: Node,
-    font_key: str = "font_a",
-    fonts_dir: Optional[Path] = None,
-) -> str:
-    root.normalize_levels(0)
-    font_family, font_face_css = build_font_face_css(font_key, fonts_dir=fonts_dir)
-
-    right_ch, left_ch = _split_balanced(root.children)
-    right_html = _build_tree_html(right_ch, "right", 0)
-    left_html = _build_tree_html(left_ch, "left", len(right_ch))
-
-    if left_ch:
-        left_tree_html = f'    <div class="left-tree tree">\n{left_html}\n    </div>'
-    else:
-        left_tree_html = ""
-
-    return _HTML_TEMPLATE.format(
-        font_face_css=font_face_css,
-        font_family=font_family,
-        canvas_bg=CANVAS_BG,
-        pad_x=PAD_X,
-        pad_y=PAD_Y,
-        branch_gap=BRANCH_GAP,
-        sibling_gap=SIBLING_GAP,
-        child_gap=CHILD_GAP,
-        subtree_gap=SUBTREE_GAP,
-        root_style=_node_style(0, ROOT_BORDER),
-        root_text=format_bidi_html(root.text),
-        right_html=right_html,
-        left_tree_html=left_tree_html,
-        js_draw=_JS_DRAW,
-    )
-
-
-class BrowserManager:
-    _playwright = None
-    _browser = None
-    _lock: Optional[asyncio.Lock] = None
-
-    @classmethod
-    def _get_lock(cls) -> asyncio.Lock:
-        if cls._lock is None:
-            cls._lock = asyncio.Lock()
-        return cls._lock
-
-    @classmethod
-    async def initialize(cls, fonts_dir: Optional[Path] = None) -> None:
-        async with cls._get_lock():
-            target_dir = Path(fonts_dir) if fonts_dir else DEFAULT_FONTS_DIR
-            for f_key in FONT_CONFIG:
-                try:
-                    build_font_face_css(f_key, fonts_dir=target_dir)
-                except Exception as exc:
-                    logger.warning("Could not pre-warm font '%s': %s", f_key, exc)
-
-            if cls._browser is None or not cls._browser.is_connected():
-                from playwright.async_api import async_playwright
-
-                if cls._playwright is not None:
-                    try:
-                        await cls._playwright.stop()
-                    except Exception:
-                        pass
-
-                cls._playwright = await async_playwright().start()
-                cls._browser = await cls._playwright.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--font-render-hinting=none",
-                        "--force-color-profile=srgb",
-                    ],
-                )
-                logger.info("Headless Chromium initialized and font cache warmed.")
-
-    @classmethod
-    async def new_context(
-        cls,
-        scale: float = 1.0,
-        vw: int = 12000,
-        vh: int = 8000,
+        if in_code_block:
+            continue
+
+        if _HR_RE.match(stripped):
+            continue
+
+        hm = _HEADING_RE.match(stripped)
+        if hm:
+            hashes, content = hm.groups()
+            cleaned = clean_topic_text(content)
+            if not cleaned:
+                continue
+            depth = float(len(hashes))
+            node = Node(text=cleaned, level=int(depth) - 1)
+
+            if depth == 1.0:
+                if root_node is None:
+                    root_node = node
+                    root_node.level = 0
+                    stack.clear()
+                    stack.append((root_node, "h", 1.0))
+                else:
+                    if len(stack) >= 1 and stack[0][1] == "h" and stack[0][2] == 1.0:
+                        wrapper_title = _stem(filename, default=default_root_title)
+                        wrapper = Node(text=wrapper_title, level=0)
+                        old_root = stack[0][0]
+                        wrapper.add_child(old_root)
+                        root_node = wrapper
+                        stack[0] = (root_node, "h", 0.0)
+                    node.level = 1
+                    root_node.add_child(node)
+                    while len(stack) > 1:
+                        stack.pop()
+                    stack.append((node, "h", 1.0))
+            else:
+                if root_node is None:
+                    _make_root(_stem(filename, default=default_root_title))
+                parent = _find_parent_for_depth(depth)
+                parent.add_child(node)
+                stack.append((node, "h", depth))
+            continue
+
+        bm = _BULLET_RE.match(raw_line)
+        if bm:
+            indent_str, content = bm.groups()
+            cleaned = clean_topic_text(content)
+            if not cleaned:
+                continue
+            indent_cols = len(indent_str.expandtabs(_TAB_SIZE))
+
+            if root_node is None:
+                _make_root(_stem(filename, default=default_root_title))
+
+            heading_base = _nearest_heading_depth()
+            depth = _compute_bullet_depth(heading_base, indent_cols)
+
+            node = Node(text=cleaned, level=0)
+            parent = _find_parent_for_depth(depth)
+            parent.add_child(node)
+            stack.append((node, "b", depth))
+            continue
+
+        cleaned = clean_topic_text(stripped)
+        if not cleaned:
+            continue
+
+        leading_ws_len = len(raw_line) - len(raw_line.lstrip(" \t"))
+        indent_cols = len(raw_line[:leading_ws_len].expandtabs(_TAB_SIZE))
+
+        if root_node is None and indent_cols == 0:
+            root_node = Node(text=cleaned, level=0)
+            stack.clear()
+            stack.append((root_node, "h", 1.0))
+        else:
+            if root_node is None:
+                _make_root(_stem(filename, default=default_root_title))
+            heading_base = _nearest_heading_depth()
+            depth = _compute_bullet_depth(heading_base, indent_cols)
+            node = Node(text=cleaned, level=0)
+            parent = _find_parent_for_depth(depth)
+            parent.add_child(node)
+            stack.append((node, "b", depth))
+
+    if root_node is None:
+        raise ValueError("متن ورودی خالی است یا هیچ ساختار قابل‌پردازشی ندارد.")
+
+    if (
+        len(root_node.children) == 1
+        and root_node.text == _stem(filename, default=default_root_title)
+        and stack
+        and stack[0][2] == 0.0
     ):
-        if cls._browser is None or not cls._browser.is_connected():
-            await cls.initialize()
-        return await cls._browser.new_context(
-            viewport={"width": vw, "height": vh},
-            device_scale_factor=scale,
+        root_node = root_node.children[0]
+
+    return root_node.normalize_levels(0)
+
+
+def parse_input(
+    content: Union[str, bytes, Path],
+    filename: Optional[str] = None,
+    default_root_title: str = "موضوع اصلی",
+) -> Node:
+    is_opml = False
+    if filename and filename.lower().endswith((".opml", ".xml")):
+        is_opml = True
+    elif isinstance(content, Path) and content.suffix.lower() in (".opml", ".xml"):
+        is_opml = True
+    else:
+        sample = _decode_source(content)[:600].lstrip()
+        if (
+            sample.startswith("<?xml")
+            or "<opml" in sample.lower()
+            or "<outline" in sample.lower()
+        ):
+            is_opml = True
+
+    if is_opml:
+        return parse_opml(
+            content, filename=filename, default_root_title=default_root_title
         )
-
-    @classmethod
-    async def shutdown(cls) -> None:
-        async with cls._get_lock():
-            if cls._browser is not None:
-                try:
-                    await cls._browser.close()
-                except Exception:
-                    pass
-                cls._browser = None
-            if cls._playwright is not None:
-                try:
-                    await cls._playwright.stop()
-                except Exception:
-                    pass
-                cls._playwright = None
-
-
-async def _load_and_draw(page, html_content: str) -> None:
-    await page.set_content(html_content, wait_until="domcontentloaded")
-    await page.evaluate("() => document.fonts ? document.fonts.ready : Promise.resolve()")
-    await page.evaluate(
-        """() => new Promise(resolve => {
-            window.__drawMindMap();
-            requestAnimationFrame(() => requestAnimationFrame(resolve));
-        })"""
-    )
-
-
-async def _measure_and_export_pdf(
-    html_content: str,
-) -> Tuple[int, int, bytes]:
-    ctx = await BrowserManager.new_context(scale=1.0, vw=14000, vh=10000)
-    try:
-        page = await ctx.new_page()
-        await _load_and_draw(page, html_content)
-
-        dims = await page.evaluate(
-            """() => {
-                const el = document.getElementById('page-root');
-                const r  = el.getBoundingClientRect();
-                return {
-                    w: Math.ceil(Math.max(r.width, el.scrollWidth)),
-                    h: Math.ceil(Math.max(r.height, el.scrollHeight))
-                };
-            }"""
-        )
-        w = max(600, int(dims["w"]))
-        h = max(400, int(dims["h"]))
-
-        await page.set_viewport_size({"width": w, "height": h})
-        await page.evaluate("() => window.__drawMindMap && window.__drawMindMap()")
-
-        await page.evaluate(
-            f"""() => {{
-                const s = document.createElement('style');
-                s.textContent =
-                    '@page {{ size: {w}px {h}px; margin: 0; }} ' +
-                    'html, body {{ width: {w}px !important; height: {h}px !important; ' +
-                    'margin: 0 !important; padding: 0 !important; overflow: hidden !important; ' +
-                    '-webkit-print-color-adjust: exact !important; ' +
-                    'print-color-adjust: exact !important; }}';
-                document.head.appendChild(s);
-            }}"""
-        )
-
-        pdf_bytes = await page.pdf(
-            width=f"{w}px",
-            height=f"{h}px",
-            print_background=True,
-            page_ranges="1",
-            margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
-        )
-        return w, h, pdf_bytes
-    finally:
-        await ctx.close()
-
-
-async def _export_hires_png(
-    html_content: str,
-    w: int,
-    h: int,
-    scale: float,
-) -> bytes:
-    ctx = await BrowserManager.new_context(scale=scale, vw=w, vh=h)
-    try:
-        page = await ctx.new_page()
-        await _load_and_draw(page, html_content)
-        locator = page.locator("#page-root")
-        return await locator.screenshot(type="png")
-    finally:
-        await ctx.close()
-
-
-async def render_mindmap(
-    root: Node,
-    font_key: str = "font_a",
-    fonts_dir: Optional[Path] = None,
-) -> RenderResult:
-    normalized_key = font_key if font_key in FONT_CONFIG else "font_a"
-    font_label = str(FONT_CONFIG[normalized_key]["button_label"])
-
-    html_content = build_mindmap_html(
-        root=root, font_key=normalized_key, fonts_dir=fonts_dir
-    )
-
-    w, h, pdf_bytes = await _measure_and_export_pdf(html_content)
-
-    scale = 1.0
-    for candidate in (3.0, 2.5, 2.0, 1.5, 1.0):
-        if max(w, h) * candidate <= 14500:
-            scale = candidate
-            break
-
-    png_bytes = await _export_hires_png(html_content, w, h, scale)
-    px_w = round(w * scale)
-    px_h = round(h * scale)
-
-    return RenderResult(
-        png_bytes=png_bytes,
-        pdf_bytes=pdf_bytes,
-        width=px_w,
-        height=px_h,
-        font_key=normalized_key,
-        font_label=font_label,
+    return parse_markdown(
+        content, filename=filename, default_root_title=default_root_title
     )
