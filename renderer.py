@@ -556,4 +556,364 @@ html, body {{
 #mindmap-wrapper {{
   direction: ltr;
   display: inline-flex;
-  flex-direction
+  flex-direction: row;
+  align-items: center;
+  gap: {branch_gap}px;
+  position: relative;
+  width: max-content;
+}}
+
+.tree {{
+  direction: ltr;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: {sibling_gap}px;
+}}
+.left-tree {{ align-items: flex-end; }}
+
+.branch-group {{
+  direction: ltr;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: {subtree_gap}px;
+}}
+.left-tree .branch-group {{
+  flex-direction: row-reverse;
+}}
+
+.branch-children {{
+  direction: ltr;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: {child_gap}px;
+}}
+.left-tree .branch-children {{
+  align-items: flex-end;
+}}
+
+/* Base Node Container */
+.node {{
+  position: relative;
+  display: flex;
+  align-items: center;
+  direction: rtl;
+  unicode-bidi: isolate;
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: break-word;
+  line-height: 1.55;
+  z-index: 1;
+}}
+
+/* Balanced Widths for 30px / 24px / 20px Typography */
+.node.level-0    {{ max-width: 400px; min-width: 180px; }}
+.node.level-1    {{ max-width: 320px; min-width: 140px; }}
+.node.level-2    {{ max-width: 380px; min-width: 80px;  }}
+.node.level-deep {{ max-width: 450px; min-width: 80px;  }}
+
+.node-inner {{
+  direction: rtl;
+  unicode-bidi: isolate;
+  display: block;
+  width: 100%;
+}}
+
+/* Central & Main Topics: Strictly Center-Aligned */
+.node.level-0 .node-inner,
+.node.level-1 .node-inner {{
+  text-align: center;
+}}
+
+/* Sub-Topics (Level 2+): Strictly Right-Aligned on BOTH Right & Left Trees */
+.node.level-2 .node-inner,
+.node.level-deep .node-inner {{
+  text-align: right;
+}}
+
+/* Keep English parentheticals & technical phrases intact and un-mirrored */
+.ltr-token {{
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: inline-block;
+  white-space: normal;
+}}
+
+#svg-canvas {{
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 0;
+}}
+</style>
+</head>
+<body>
+<div id="page-root">
+  <div id="mindmap-wrapper">
+
+{left_tree_html}
+
+    <div class="central-node node level-0"
+         data-level="0"
+         style="{root_style}">
+      <div class="node-inner" dir="rtl">{root_text}</div>
+    </div>
+
+    <div class="right-tree tree">
+{right_html}
+    </div>
+
+  </div>
+</div>
+<script>
+{js_draw}
+</script>
+</body>
+</html>
+"""
+
+
+def build_mindmap_html(
+    root: Node,
+    font_key: str = "font_a",
+    fonts_dir: Optional[Path] = None,
+) -> str:
+    """Build the self-contained HTML5/CSS3/SVG document with Base64 embedded font."""
+    root.normalize_levels(0)
+    font_family, font_face_css = build_font_face_css(font_key, fonts_dir=fonts_dir)
+
+    right_ch, left_ch = _split_balanced(root.children)
+    right_html = _build_tree_html(right_ch, "right", 0)
+    left_html = _build_tree_html(left_ch, "left", len(right_ch))
+
+    if left_ch:
+        left_tree_html = f'    <div class="left-tree tree">\n{left_html}\n    </div>'
+    else:
+        left_tree_html = ""
+
+    return _HTML_TEMPLATE.format(
+        font_face_css=font_face_css,
+        font_family=font_family,
+        canvas_bg=CANVAS_BG,
+        pad_x=PAD_X,
+        pad_y=PAD_Y,
+        branch_gap=BRANCH_GAP,
+        sibling_gap=SIBLING_GAP,
+        child_gap=CHILD_GAP,
+        subtree_gap=SUBTREE_GAP,
+        root_style=_node_style(0, ROOT_BORDER),
+        root_text=format_bidi_html(root.text),
+        right_html=right_html,
+        left_tree_html=left_tree_html,
+        js_draw=_JS_DRAW,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Singleton Playwright Browser Manager
+# ---------------------------------------------------------------------------
+
+
+class BrowserManager:
+    """Async-safe Singleton manager for Headless Chromium."""
+
+    _playwright = None
+    _browser = None
+    _lock: Optional[asyncio.Lock] = None
+
+    @classmethod
+    def _get_lock(cls) -> asyncio.Lock:
+        if cls._lock is None:
+            cls._lock = asyncio.Lock()
+        return cls._lock
+
+    @classmethod
+    async def initialize(cls, fonts_dir: Optional[Path] = None) -> None:
+        async with cls._get_lock():
+            target_dir = Path(fonts_dir) if fonts_dir else DEFAULT_FONTS_DIR
+            for f_key in FONT_CONFIG:
+                try:
+                    build_font_face_css(f_key, fonts_dir=target_dir)
+                except Exception as exc:
+                    logger.warning("Could not pre-warm font '%s': %s", f_key, exc)
+
+            if cls._browser is None or not cls._browser.is_connected():
+                from playwright.async_api import async_playwright
+
+                if cls._playwright is not None:
+                    try:
+                        await cls._playwright.stop()
+                    except Exception:
+                        pass
+
+                cls._playwright = await async_playwright().start()
+                cls._browser = await cls._playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--font-render-hinting=none",
+                        "--force-color-profile=srgb",
+                    ],
+                )
+                logger.info("Headless Chromium initialized and font cache warmed.")
+
+    @classmethod
+    async def new_context(
+        cls,
+        scale: float = 1.0,
+        vw: int = 12000,
+        vh: int = 8000,
+    ):
+        if cls._browser is None or not cls._browser.is_connected():
+            await cls.initialize()
+        return await cls._browser.new_context(
+            viewport={"width": vw, "height": vh},
+            device_scale_factor=scale,
+        )
+
+    @classmethod
+    async def shutdown(cls) -> None:
+        async with cls._get_lock():
+            if cls._browser is not None:
+                try:
+                    await cls._browser.close()
+                except Exception:
+                    pass
+                cls._browser = None
+            if cls._playwright is not None:
+                try:
+                    await cls._playwright.stop()
+                except Exception:
+                    pass
+                cls._playwright = None
+
+
+# ---------------------------------------------------------------------------
+# High-DPI PNG & Vector PDF Rendering Pipeline (Zero-Clipping)
+# ---------------------------------------------------------------------------
+
+
+async def _load_and_draw(page, html_content: str) -> None:
+    """Load HTML in memory, wait for custom fonts, and render SVG connectors."""
+    await page.set_content(html_content, wait_until="domcontentloaded")
+    await page.evaluate("() => document.fonts ? document.fonts.ready : Promise.resolve()")
+    await page.evaluate(
+        """() => new Promise(resolve => {
+            window.__drawMindMap();
+            requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })"""
+    )
+
+
+async def _measure_and_export_pdf(
+    html_content: str,
+) -> Tuple[int, int, bytes]:
+    """
+    Measure exact full-page content dimensions on an unconstrained canvas
+    so no top/bottom/left/right nodes are ever clipped, then export Vector PDF.
+    """
+    ctx = await BrowserManager.new_context(scale=1.0, vw=14000, vh=10000)
+    try:
+        page = await ctx.new_page()
+        await _load_and_draw(page, html_content)
+
+        dims = await page.evaluate(
+            """() => {
+                const el = document.getElementById('page-root');
+                const r  = el.getBoundingClientRect();
+                return {
+                    w: Math.ceil(Math.max(r.width, el.scrollWidth)),
+                    h: Math.ceil(Math.max(r.height, el.scrollHeight))
+                };
+            }"""
+        )
+        w = max(600, int(dims["w"]))
+        h = max(400, int(dims["h"]))
+
+        await page.set_viewport_size({"width": w, "height": h})
+        await page.evaluate("() => window.__drawMindMap && window.__drawMindMap()")
+
+        await page.evaluate(
+            f"""() => {{
+                const s = document.createElement('style');
+                s.textContent =
+                    '@page {{ size: {w}px {h}px; margin: 0; }} ' +
+                    'html, body {{ width: {w}px !important; height: {h}px !important; ' +
+                    'margin: 0 !important; padding: 0 !important; overflow: hidden !important; ' +
+                    '-webkit-print-color-adjust: exact !important; ' +
+                    'print-color-adjust: exact !important; }}';
+                document.head.appendChild(s);
+            }}"""
+        )
+
+        pdf_bytes = await page.pdf(
+            width=f"{w}px",
+            height=f"{h}px",
+            print_background=True,
+            page_ranges="1",
+            margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
+        )
+        return w, h, pdf_bytes
+    finally:
+        await ctx.close()
+
+
+async def _export_hires_png(
+    html_content: str,
+    w: int,
+    h: int,
+    scale: float,
+) -> bytes:
+    """Capture high-DPI PNG screenshot of the full unclipped `#page-root`."""
+    ctx = await BrowserManager.new_context(scale=scale, vw=w, vh=h)
+    try:
+        page = await ctx.new_page()
+        await _load_and_draw(page, html_content)
+        locator = page.locator("#page-root")
+        return await locator.screenshot(type="png")
+    finally:
+        await ctx.close()
+
+
+async def render_mindmap(
+    root: Node,
+    font_key: str = "font_a",
+    fonts_dir: Optional[Path] = None,
+) -> RenderResult:
+    """Render `root` into high-resolution PNG bytes and vector PDF bytes."""
+    normalized_key = font_key if font_key in FONT_CONFIG else "font_a"
+    font_label = str(FONT_CONFIG[normalized_key]["button_label"])
+
+    html_content = build_mindmap_html(
+        root=root, font_key=normalized_key, fonts_dir=fonts_dir
+    )
+
+    w, h, pdf_bytes = await _measure_and_export_pdf(html_content)
+
+    scale = 1.0
+    for candidate in (3.0, 2.5, 2.0, 1.5, 1.0):
+        if max(w, h) * candidate <= 14500:
+            scale = candidate
+            break
+
+    png_bytes = await _export_hires_png(html_content, w, h, scale)
+    px_w = round(w * scale)
+    px_h = round(h * scale)
+
+    return RenderResult(
+        png_bytes=png_bytes,
+        pdf_bytes=pdf_bytes,
+        width=px_w,
+        height=px_h,
+        font_key=normalized_key,
+        font_label=font_label,
+    )
