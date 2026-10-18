@@ -1,9 +1,13 @@
 """
-renderer.py - Low-Memory, Timeout-Protected XMind Renderer for Render (512MB RAM)
-- Central Topic (Level 0): 30px, Center-aligned
-- Main Topics (Level 1): 24px, Center-aligned
-- Sub-topics (Level 2+): 20px, Right-aligned on both sides
-- Single-context rendering pipeline to prevent OOM freezes on Render Free Tier
+renderer.py - Xmind Official Elbow & Rainbow-#245570 Style Renderer
+===================================================================
+Implements the exact visual and structural specification from:
+- Theme: Rainbow-#245570-MULTI_LINE_COLORS
+- Central Topic Fill: #245570 (Text: #FFFFFF, 30px, Center-aligned)
+- Main Topics: #0B5D99, #534E96, #7B4083, #A23E6A, #C34150, #CA5835 (24px, Center-aligned)
+- Subtopics: Rounded Rectangle boxes (`roundedRect`), 20px, Right-aligned
+- Branch Connection: Orthogonal 90-degree Elbow steps (`org.xmind.branchConnection.elbow`)
+- Native `.xmind` archive generator (`content.json`, `manifest.json`, `metadata.json`)
 """
 
 from __future__ import annotations
@@ -12,11 +16,15 @@ import asyncio
 import base64
 import functools
 import html
+import io
+import json
 import logging
 import re
+import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from parser import Node
 
@@ -25,7 +33,7 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_FONTS_DIR = BASE_DIR / "fonts"
 
-PAGE_TIMEOUT_MS = 25_000  # حداکثر ۲۵ ثانیه برای هر عملیات صفحه
+PAGE_TIMEOUT_MS = 25_000
 
 FONT_CONFIG: Dict[str, Dict[str, object]] = {
     "font_a": {
@@ -61,32 +69,32 @@ FONT_CONFIG: Dict[str, Dict[str, object]] = {
     },
 }
 
-# سایز دقیق فونت‌ها طبق دستور شما
+# سایز فونت‌ها: تاپیک مرکزی ۳۰، شاخه‌های اصلی ۲۴، زیرشاخه‌ها ۲۰
 FONT_SIZE_CENTRAL = 30
 FONT_SIZE_MAIN = 24
 FONT_SIZE_SUB = 20
 
+# پالت رنگی دقیق استخراج‌شده از Xmind (Rainbow-#245570-MULTI_LINE_COLORS)
 RAINBOW_PALETTE: List[str] = [
-    "#EF476F",
-    "#F77F00",
-    "#D97706",
-    "#10B981",
-    "#2563EB",
-    "#7C3AED",
+    "#0B5D99",  # شاخه ۱: آبی کلاسیک
+    "#534E96",  # شاخه ۲: نیلی / بنفش تیره
+    "#7B4083",  # شاخه ۳: ارغوانی / بنفش یاسی
+    "#A23E6A",  # شاخه ۴: شرابی / بورگاندی
+    "#C34150",  # شاخه ۵: یاقوتی / قرمز تیره
+    "#CA5835",  # شاخه ۶: نارنجی گرم / کهربایی
 ]
 
-ROOT_BG = "#1E1E2E"
-ROOT_BORDER = "#7C3AED"
-ROOT_COLOR = "#FFFFFF"
-SUBTEXT_COLOR = "#1E293B"
-CANVAS_BG = "#F8FAFC"
+ROOT_BG = "#245570"       # سرمه‌ای نفتی رسمی Xmind
+ROOT_COLOR = "#FFFFFF"    # سفید خالص
+SUBTEXT_COLOR = "#1E293B" # سرمه‌ای تیره برای خوانایی کامل زیرشاخه‌ها
+CANVAS_BG = "#FFFFFF"     # پس‌زمینه سفید خالص مطابق Map Fill
 
-PAD_X = 90
-PAD_Y = 80
-BRANCH_GAP = 72
-SIBLING_GAP = 20
+PAD_X = 95
+PAD_Y = 85
+BRANCH_GAP = 68
+SIBLING_GAP = 22
 CHILD_GAP = 12
-SUBTREE_GAP = 44
+SUBTREE_GAP = 48
 
 
 @dataclass(frozen=True)
@@ -97,18 +105,40 @@ class RenderResult:
     height: int
     font_key: str
     font_label: str
+    xmind_bytes: bytes = b""
 
 
-# تشخیص عبارات انگلیسی و پرانتزها برای جلوگیری از برعکس شدن پرانتز در متن فارسی
+# ---------------------------------------------------------------------------
+# BiDi & Emoji Formatter (Fixes Parentheses Mirroring & Emoji Overlap)
+# ---------------------------------------------------------------------------
+
 _BIDI_TOKEN_RE = re.compile(
-    r"\([A-Za-z0-9_./+:=#&*,\-–—\s]+\)"
+    r"\([A-Za-z0-9_./+:=#&*,\-–—\%\s]+\)"
     r"|<[A-Za-z0-9_.:/\-]+>"
     r"|[A-Za-z0-9][A-Za-z0-9_./+:=#&*\-]*(?:\s+[A-Za-z0-9_./+:=#&*\-]+)*"
 )
 
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0000FE00-\U0000FE0F"
+    "\U0001F1E6-\U0001F1FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _isolate_emojis_in_escaped_text(escaped_text: str) -> str:
+    """جداسازی اموجی‌ها با فاصله ایمن تا روی حروف فارسی (مثل «🎯 مدیریت») نیفتند."""
+    return _EMOJI_RE.sub(
+        lambda m: f'<span class="emoji-token">{m.group(0)}</span>',
+        escaped_text,
+    )
+
 
 def format_bidi_html(text: str) -> str:
-    """ایزولاسیون عبارات انگلیسی و پرانتزها با LRM (&lrm;) برای جلوگیری از وارونگی پرانتز."""
+    """ایزولاسیون عبارات انگلیسی، پرانتزها و اموجی‌ها در متن فارسی."""
     parts: List[str] = []
     last_idx = 0
 
@@ -120,7 +150,8 @@ def format_bidi_html(text: str) -> str:
             continue
 
         if start > last_idx:
-            parts.append(html.escape(text[last_idx:start]))
+            seg = html.escape(text[last_idx:start])
+            parts.append(_isolate_emojis_in_escaped_text(seg))
 
         parts.append(
             f'<bdi class="ltr-token" dir="ltr">&lrm;{html.escape(token)}&lrm;</bdi>'
@@ -128,9 +159,28 @@ def format_bidi_html(text: str) -> str:
         last_idx = end
 
     if last_idx < len(text):
-        parts.append(html.escape(text[last_idx:]))
+        seg = html.escape(text[last_idx:])
+        parts.append(_isolate_emojis_in_escaped_text(seg))
 
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Color Helper for Subtopic Tinted Boxes
+# ---------------------------------------------------------------------------
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    if len(h) == 6:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha:.2f})"
+    return f"rgba(36,85,112,{alpha:.2f})"
+
+
+# ---------------------------------------------------------------------------
+# Smart Font Resolver & Base64 Data URI Injector
+# ---------------------------------------------------------------------------
 
 
 def _resolve_font_file(font_key: str, fonts_dir: Path) -> Optional[Path]:
@@ -208,6 +258,11 @@ def build_font_face_css(
     return family_name, ""
 
 
+# ---------------------------------------------------------------------------
+# Balanced Clockwise Tree Split
+# ---------------------------------------------------------------------------
+
+
 def _count_descendants(node: Node) -> int:
     return sum(1 + _count_descendants(c) for c in node.children)
 
@@ -236,29 +291,44 @@ def _split_balanced(children: List[Node]) -> Tuple[List[Node], List[Node]]:
     return children[:best_k], children[best_k:]
 
 
+# ---------------------------------------------------------------------------
+# HTML, CSS & Xmind Elbow SVG Builders
+# ---------------------------------------------------------------------------
+
+
 def _node_style(level: int, color: str) -> str:
+    """
+    استایل کادرها دقیقاً منطبق با `xmind_template.json` (org.xmind.topicShape.roundedRect):
+    - سطح ۰ (تاپیک مرکزی): پس‌زمینه #245570، متن سفید، سایز ۳۰، وسط‌چین، بدون کادر اضافه.
+    - سطح ۱ (شاخه‌های اصلی): پس‌زمینه پالت ۶ رنگ، متن سفید، سایز ۲۴، وسط‌چین.
+    - سطح ۲ به بالا (زیرشاخه‌ها): کادر مستطیلی با گوشه‌های گرد و تینت ملایم هم‌رنگ شاخه، سایز ۲۰، راست‌چین.
+    """
     if level == 0:
         return (
-            f"background:{ROOT_BG};border:3px solid {ROOT_BORDER};"
-            f"color:{ROOT_COLOR};border-radius:26px;"
-            "padding:18px 34px;"
+            f"background:{ROOT_BG};border:none;"
+            f"color:{ROOT_COLOR};border-radius:14px;"
+            "padding:18px 36px;"
             f"font-size:{FONT_SIZE_CENTRAL}px;font-weight:700;"
             "text-align:center;justify-content:center;"
-            "box-shadow:0 6px 24px rgba(124,58,237,0.28);"
+            "box-shadow:0 4px 14px rgba(36,85,112,0.22);"
         )
     if level == 1:
         return (
-            f"background:{color};color:#FFFFFF;"
-            "border-radius:20px;padding:12px 26px;"
+            f"background:{color};border:none;color:#FFFFFF;"
+            "border-radius:11px;padding:12px 26px;"
             f"font-size:{FONT_SIZE_MAIN}px;font-weight:600;"
             "text-align:center;justify-content:center;"
-            "text-shadow:0 1px 2px rgba(0,0,0,0.18);"
-            "box-shadow:0 3px 12px rgba(0,0,0,0.14);"
+            "box-shadow:0 2px 8px rgba(0,0,0,0.10);"
         )
+    # سطح ۲+ (Subtopic roundedRect در تم Rainbow-#245570)
+    tint_bg = _hex_to_rgba(color, 0.11 if level == 2 else 0.07)
+    tint_border = _hex_to_rgba(color, 0.28 if level == 2 else 0.20)
     return (
-        "background:transparent;"
+        f"background:{tint_bg};"
+        f"border:1.5px solid {tint_border};"
         f"color:{SUBTEXT_COLOR};"
-        "padding:6px 14px 9px 14px;"
+        "border-radius:9px;"
+        "padding:7px 16px;"
         f"font-size:{FONT_SIZE_SUB}px;font-weight:500;"
         "text-align:right;justify-content:flex-start;"
     )
@@ -302,6 +372,7 @@ def _build_tree_html(branches: List[Node], side: str, color_offset: int) -> str:
     )
 
 
+# موتور ترسیم خطوط پله‌ای / قائمه ۹۰ درجه (org.xmind.branchConnection.elbow)
 _JS_DRAW = r"""
 window.__drawMindMap = function () {
   const existing = document.getElementById('svg-canvas');
@@ -332,93 +403,61 @@ window.__drawMindMap = function () {
     };
   }
 
-  function getParentAnchorY(pr, parentLevel) {
-    return (parentLevel >= 2) ? pr.bottom : pr.cy;
-  }
+  /*
+   * ترسیم خط پله‌ای قائمه (Xmind Elbow: org.xmind.branchConnection.elbow)
+   * با گوشه‌های ۹۰ درجه استاندارد و انحنای ظریف در زاویه شکست
+   */
+  function makeElbowPath(x1, y1, x2, y2, side, cornerRadius) {
+    const dy = y2 - y1;
+    const ady = Math.abs(dy);
+    if (ady < 1.5) {
+      return `M ${x1},${y1} L ${x2},${y2}`;
+    }
 
-  function makeTaperedPath(x1, y1, x2, y2, w1, w2) {
-    const dx = x2 - x1;
-    const cx1 = x1 + dx * 0.5, cy1 = y1;
-    const cx2 = x2 - dx * 0.5, cy2 = y2;
+    const dirX = (side === 'right') ? 1 : -1;
+    const dirY = (dy >= 0) ? 1 : -1;
+    const midX = x1 + (x2 - x1) * 0.45;
+    const r = Math.min(cornerRadius, ady / 2, Math.abs(midX - x1) * 0.8, Math.abs(x2 - midX) * 0.8);
 
-    let chx = x2 - x1, chy = y2 - y1;
-    const chl = Math.hypot(chx, chy) || 1;
-    chx /= chl; chy /= chl;
-    const nmx = -chy, nmy = chx;
+    if (r < 1.5) {
+      return `M ${x1},${y1} L ${midX},${y1} L ${midX},${y2} L ${x2},${y2}`;
+    }
 
-    let t0x = cx1 - x1, t0y = cy1 - y1;
-    const l0 = Math.hypot(t0x, t0y) || 1;
-    t0x /= l0; t0y /= l0;
-    const n0x = -t0y, n0y = t0x;
-
-    let t1x = x2 - cx2, t1y = y2 - cy2;
-    const l1 = Math.hypot(t1x, t1y) || 1;
-    t1x /= l1; t1y /= l1;
-    const n1x = -t1y, n1y = t1x;
-
-    const h0 = w1 / 2;
-    const hm = (w1 + w2) / 4;
-    const h1 = w2 / 2;
-
-    const ox1  = x1  + n0x * h0, oy1  = y1  + n0y * h0;
-    const ocx1 = cx1 + nmx * hm, ocy1 = cy1 + nmy * hm;
-    const ocx2 = cx2 + nmx * hm, ocy2 = cy2 + nmy * hm;
-    const ox2  = x2  + n1x * h1, oy2  = y2  + n1y * h1;
-
-    const ix1  = x1  - n0x * h0, iy1  = y1  - n0y * h0;
-    const icx1 = cx1 - nmx * hm, icy1 = cy1 - nmy * hm;
-    const icx2 = cx2 - nmx * hm, icy2 = cy2 - nmy * hm;
-    const ix2  = x2  - n1x * h1, iy2  = y2  - n1y * h1;
-
-    return (
-      `M ${ox1},${oy1} ` +
-      `C ${ocx1},${ocy1} ${ocx2},${ocy2} ${ox2},${oy2} ` +
-      `L ${ix2},${iy2} ` +
-      `C ${icx2},${icy2} ${icx1},${icy1} ${ix1},${iy1} Z`
-    );
-  }
-
-  function makeContinuousUnderlinePath(x1, y1, x2_inner, y2, x2_outer) {
-    const dx = x2_inner - x1;
-    const cx1 = x1 + dx * 0.5;
-    const cx2 = x2_inner - dx * 0.5;
     return (
       `M ${x1},${y1} ` +
-      `C ${cx1},${y1} ${cx2},${y2} ${x2_inner},${y2} ` +
-      `L ${x2_outer},${y2}`
+      `L ${midX - dirX * r},${y1} ` +
+      `Q ${midX},${y1} ${midX},${y1 + dirY * r} ` +
+      `L ${midX},${y2 - dirY * r} ` +
+      `Q ${midX},${y2} ${midX + dirX * r},${y2} ` +
+      `L ${x2},${y2}`
     );
   }
 
-  function drawCurve(parentEl, childEl, side, connectionLevel, color) {
+  function drawElbowConnection(parentEl, childEl, side, connectionLevel, color) {
     const pr = toLocal(parentEl.getBoundingClientRect());
     const cr = toLocal(childEl.getBoundingClientRect());
 
-    const parentLevel = parseInt(parentEl.dataset.level || '0', 10);
-    const childLevel  = parseInt(childEl.dataset.level  || '0', 10);
-
     const pathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
 
+    const x1 = (side === 'right') ? pr.right : pr.x;
+    const y1 = pr.cy;
+    const x2 = (side === 'right') ? cr.x : cr.right;
+    const y2 = cr.cy;
+
     if (connectionLevel === 0) {
-      const x1 = (side === 'right') ? pr.right : pr.x;
-      const yShift = Math.max(-pr.h * 0.22, Math.min(pr.h * 0.22, (cr.cy - pr.cy) * 0.20));
-      const y1 = pr.cy + yShift;
-      const x2 = (side === 'right') ? cr.x : cr.right;
-      const y2 = cr.cy;
-
-      pathEl.setAttribute('d', makeTaperedPath(x1, y1, x2, y2, 9, 3.2));
-      pathEl.setAttribute('fill', color);
-      pathEl.setAttribute('stroke', 'none');
-    } else {
-      const x1 = (side === 'right') ? pr.right : pr.x;
-      const y1 = getParentAnchorY(pr, parentLevel);
-      const x2_inner = (side === 'right') ? cr.x : cr.right;
-      const x2_outer = (side === 'right') ? cr.right : cr.x;
-      const y2 = (childLevel >= 2) ? cr.bottom : cr.cy;
-
-      pathEl.setAttribute('d', makeContinuousUnderlinePath(x1, y1, x2_inner, y2, x2_outer));
+      /* اتصال تاپیک مرکزی به شاخه‌های اصلی: ضخامت 3pt (معادل 3.5px) و بدون Tapered */
+      pathEl.setAttribute('d', makeElbowPath(x1, y1, x2, y2, side, 8));
       pathEl.setAttribute('fill', 'none');
       pathEl.setAttribute('stroke', color);
-      pathEl.setAttribute('stroke-width', '2.6');
+      pathEl.setAttribute('stroke-width', '3.5');
+      pathEl.setAttribute('stroke-linecap', 'round');
+      pathEl.setAttribute('stroke-linejoin', 'round');
+    } else {
+      /* اتصال شاخه‌های اصلی به زیرشاخه‌ها: ضخامت 2pt (معادل 2.4px) پله‌ای */
+      pathEl.setAttribute('d', makeElbowPath(x1, y1, x2, y2, side, 6));
+      pathEl.setAttribute('fill', 'none');
+      pathEl.setAttribute('stroke', color);
+      pathEl.setAttribute('stroke-width', '2.4');
       pathEl.setAttribute('stroke-linecap', 'round');
       pathEl.setAttribute('stroke-linejoin', 'round');
     }
@@ -430,7 +469,7 @@ window.__drawMindMap = function () {
     const nodeEl = bgEl.querySelector(':scope > .node');
     const color  = bgEl.dataset.color;
     if (parentNodeEl && nodeEl) {
-      drawCurve(parentNodeEl, nodeEl, side, connectionLevel, color);
+      drawElbowConnection(parentNodeEl, nodeEl, side, connectionLevel, color);
     }
     const childrenEl = bgEl.querySelector(':scope > .branch-children');
     if (childrenEl && nodeEl) {
@@ -463,7 +502,7 @@ _HTML_TEMPLATE = """\
 html, body {{
   direction: ltr;
   background: {canvas_bg};
-  font-family: '{font_family}', 'Tahoma', sans-serif;
+  font-family: '{font_family}', 'NeverMind', 'Tahoma', 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji', sans-serif;
   overflow: visible;
   width: max-content;
   height: max-content;
@@ -536,10 +575,10 @@ html, body {{
   z-index: 1;
 }}
 
-.node.level-0    {{ max-width: 400px; min-width: 180px; }}
-.node.level-1    {{ max-width: 320px; min-width: 140px; }}
-.node.level-2    {{ max-width: 380px; min-width: 80px;  }}
-.node.level-deep {{ max-width: 450px; min-width: 80px;  }}
+.node.level-0    {{ max-width: 420px; min-width: 190px; }}
+.node.level-1    {{ max-width: 330px; min-width: 140px; }}
+.node.level-2    {{ max-width: 390px; min-width: 90px;  }}
+.node.level-deep {{ max-width: 460px; min-width: 90px;  }}
 
 .node-inner {{
   direction: rtl;
@@ -548,23 +587,29 @@ html, body {{
   width: 100%;
 }}
 
-/* وسط‌چین شدن تاپیک مرکزی (۳۰) و تاپیک‌های اصلی (۲۴) */
+/* وسط‌چین شدن تاپیک مرکزی (۳۰) و شاخه‌های اصلی (۲۴) */
 .node.level-0 .node-inner,
 .node.level-1 .node-inner {{
   text-align: center;
 }}
 
-/* راست‌چین شدن تمام زیرشاخه‌ها (۲۰) در هر دو سمت چپ و راست */
+/* راست‌چین شدن زیرشاخه‌ها (۲۰) در هر دو سمت چپ و راست */
 .node.level-2 .node-inner,
 .node.level-deep .node-inner {{
   text-align: right;
 }}
 
-/* حفظ جریان طبیعی عبارات انگلیسی و پرانتزها در دل متن فارسی */
 .ltr-token {{
   direction: ltr;
   unicode-bidi: isolate;
   display: inline;
+}}
+
+.emoji-token {{
+  display: inline-block;
+  margin: 0 4px;
+  font-family: 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji', sans-serif;
+  vertical-align: middle;
 }}
 
 #svg-canvas {{
@@ -630,12 +675,176 @@ def build_mindmap_html(
         sibling_gap=SIBLING_GAP,
         child_gap=CHILD_GAP,
         subtree_gap=SUBTREE_GAP,
-        root_style=_node_style(0, ROOT_BORDER),
+        root_style=_node_style(0, ROOT_BG),
         root_text=format_bidi_html(root.text),
         right_html=right_html,
         left_tree_html=left_tree_html,
         js_draw=_JS_DRAW,
     )
+
+
+# ---------------------------------------------------------------------------
+# Native `.xmind` File Builder (Matches `xmind_template.json` Schema)
+# ---------------------------------------------------------------------------
+
+
+def _node_to_xmind_topic(node: Node, branch_color: Optional[str] = None) -> Dict[str, Any]:
+    topic_id = f"topic-{uuid.uuid4().hex[:12]}"
+    if node.level == 1 and branch_color:
+        topic_data: Dict[str, Any] = {
+            "id": topic_id,
+            "title": node.text,
+            "style": {
+                "id": f"style-{uuid.uuid4().hex[:8]}",
+                "properties": {
+                    "svg:fill": branch_color,
+                    "line-color": branch_color,
+                    "fo:color": "#FFFFFF",
+                    "line-class": "org.xmind.branchConnection.elbow",
+                    "shape-class": "org.xmind.topicShape.roundedRect",
+                },
+            },
+        }
+    else:
+        topic_data = {
+            "id": topic_id,
+            "title": node.text,
+            "style": {
+                "properties": {
+                    "line-class": "org.xmind.branchConnection.elbow",
+                    "shape-class": "org.xmind.topicShape.roundedRect",
+                }
+            },
+        }
+
+    if node.children:
+        topic_data["children"] = {
+            "attached": [
+                _node_to_xmind_topic(c, branch_color=branch_color)
+                for c in node.children
+            ]
+        }
+    return topic_data
+
+
+def build_xmind_bytes(root: Node) -> bytes:
+    """تولید مستقیم فایل `.xmind` در حافظه رم مطابق با ساختار `xmind_template.json`."""
+    root.normalize_levels(0)
+    sheet_id = "sheet-root-01"
+
+    attached_main_topics = [
+        _node_to_xmind_topic(
+            child,
+            branch_color=RAINBOW_PALETTE[idx % len(RAINBOW_PALETTE)],
+        )
+        for idx, child in enumerate(root.children)
+    ]
+
+    content_json_data = [
+        {
+            "id": sheet_id,
+            "class": "sheet",
+            "title": root.text[:50] or "Map 1",
+            "rootTopic": {
+                "id": "central-topic-id",
+                "class": "topic",
+                "title": root.text,
+                "structureClass": "org.xmind.ui.map.clockwise",
+                "children": {"attached": attached_main_topics},
+            },
+            "extensions": [
+                {
+                    "provider": "org.xmind.ui.skeleton.structure.style",
+                    "content": {
+                        "centralTopic": "org.xmind.ui.map.clockwise",
+                        "mainTopic": "org.xmind.ui.logic.right",
+                    },
+                }
+            ],
+            "theme": {
+                "id": "theme-rainbow-elbow",
+                "colorThemeId": "Rainbow-#245570-MULTI_LINE_COLORS",
+                "skeletonThemeId": "db4a5df4db39a8cd1310ea55ea",
+                "map": {
+                    "id": "map-style-id",
+                    "properties": {
+                        "svg:fill": "#ffffff",
+                        "multi-line-colors": "#0B5D99 #534E96 #7B4083 #A23E6A #C34150 #CA5835",
+                        "color-list": "#000229 #1F2766 #52CC83 #4D86DB #99142F #245570",
+                        "line-tapered": "none",
+                    },
+                },
+                "centralTopic": {
+                    "id": "ct-style-id",
+                    "properties": {
+                        "svg:fill": "#245570",
+                        "line-color": "#245570",
+                        "fo:color": "#FFFFFF",
+                        "shape-class": "org.xmind.topicShape.roundedRect",
+                        "line-class": "org.xmind.branchConnection.elbow",
+                        "line-width": "3pt",
+                        "line-pattern": "solid",
+                        "fill-pattern": "solid",
+                        "border-line-width": "0pt",
+                        "fo:font-family": "NeverMind",
+                        "fo:font-size": "30pt",
+                        "fo:font-weight": 500,
+                        "fo:text-align": "center",
+                    },
+                },
+                "mainTopic": {
+                    "id": "mt-style-id",
+                    "properties": {
+                        "shape-class": "org.xmind.topicShape.roundedRect",
+                        "line-class": "org.xmind.branchConnection.elbow",
+                        "line-width": "2pt",
+                        "fill-pattern": "solid",
+                        "border-line-width": "0pt",
+                        "fo:font-family": "NeverMind",
+                        "fo:font-size": "18pt",
+                        "fo:font-weight": 500,
+                        "fo:text-align": "center",
+                    },
+                },
+                "subTopic": {
+                    "id": "st-style-id",
+                    "properties": {
+                        "shape-class": "org.xmind.topicShape.roundedRect",
+                        "line-class": "org.xmind.branchConnection.elbow",
+                        "line-width": "2pt",
+                        "fill-pattern": "solid",
+                        "border-line-width": "0pt",
+                        "fo:font-family": "NeverMind",
+                        "fo:font-size": "14pt",
+                        "fo:font-weight": 400,
+                        "fo:text-align": "right",
+                    },
+                },
+            },
+            "topicPositioning": "fixed",
+            "coreVersion": "2.99.0",
+        }
+    ]
+
+    manifest = {"file-entries": {"content.json": {}, "metadata.json": {}}}
+    metadata = {
+        "modifier": "Vana 22.11.3656",
+        "dataStructureVersion": "1",
+        "layoutEngineVersion": "2",
+        "activeSheetId": sheet_id,
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("content.json", json.dumps(content_json_data, ensure_ascii=False))
+        zf.writestr("manifest.json", json.dumps(manifest))
+        zf.writestr("metadata.json", json.dumps(metadata))
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Singleton Playwright Browser Manager
+# ---------------------------------------------------------------------------
 
 
 class BrowserManager:
@@ -741,20 +950,14 @@ async def render_mindmap(
     font_key: str = "font_a",
     fonts_dir: Optional[Path] = None,
 ) -> RenderResult:
-    """
-    Single-Pass Low-Memory Render Pipeline:
-    1. Opens a lightweight viewport (1400x900) with scale=1.75 (fits easily in 512MB RAM).
-    2. Loads HTML once, waits for fonts (with timeout), draws SVG, and measures exact size.
-    3. Resizes viewport to exact bounding box, captures high-res PNG, then exports Vector PDF.
-    """
     normalized_key = font_key if font_key in FONT_CONFIG else "font_a"
     font_label = str(FONT_CONFIG[normalized_key]["button_label"])
 
     html_content = build_mindmap_html(
         root=root, font_key=normalized_key, fonts_dir=fonts_dir
     )
+    xmind_bytes = build_xmind_bytes(root)
 
-    # انتخاب مقیاس هوشمند بر اساس تعداد گره‌ها برای جلوگیری از پر شدن رم ۵۱۲ مگابایتی Render
     total_nodes = root.count_nodes()
     scale = 2.0 if total_nodes <= 35 else 1.6
 
@@ -769,7 +972,6 @@ async def render_mindmap(
             timeout=PAGE_TIMEOUT_MS,
         )
 
-        # انتظار برای فونت‌ها با سقف زمانی مشخص (عدم فریز در صورت تاخیر فونت)
         try:
             await asyncio.wait_for(
                 page.evaluate("() => document.fonts ? document.fonts.ready : Promise.resolve()"),
@@ -778,7 +980,6 @@ async def render_mindmap(
         except Exception:
             logger.warning("Font ready wait timed out; continuing render.")
 
-        # ترسیم اولیه و اندازه‌گیری دقیق کل نقشه
         dims = await page.evaluate(
             """() => new Promise(resolve => {
                 window.__drawMindMap();
@@ -804,11 +1005,9 @@ async def render_mindmap(
             })"""
         )
 
-        # ۱. دریافت تصویر PNG باکیفیت
         locator = page.locator("#page-root")
         png_bytes = await locator.screenshot(type="png", timeout=PAGE_TIMEOUT_MS)
 
-        # ۲. دریافت فایل Vector PDF در همان صفحه (بدون باز کردن مجدد مرورگر)
         await page.evaluate(
             f"""() => {{
                 const s = document.createElement('style');
@@ -840,6 +1039,7 @@ async def render_mindmap(
             height=px_h,
             font_key=normalized_key,
             font_label=font_label,
+            xmind_bytes=xmind_bytes,
         )
     finally:
         try:
